@@ -57,24 +57,35 @@ smodem 不会偷偷往跳板机上写东西）。
 
 ## 作为库使用
 
-smodem 是**一个可复用库 + 一个薄命令行 binary**。核心是 **sans-io** 的：
-喂它字节和时间，它吐出要发的字节和事件，不碰 socket——所以能塞进任何 I/O 模型，
-也能只取其中一层（只要线协议编解码，或只要多路复用）。
+smodem 是**一个可复用库 + 一个薄命令行 binary**，库本身自底向上分层：
 
-```zig
-// build.zig.zon 里加依赖后：
-const smodem = @import("smodem");
-
-// 开箱即用：起一个完整隧道
-try smodem.run(alloc, .{ .listen_port = 1080, .target = "user@host" });
-
-// 或者只用 sans-io 引擎，自己接 I/O：
-var s = try smodem.Session.init(alloc, .{}, .client);
-try s.pushTunnelBytes(recv_from_ssh);
-while (s.nextEvent()) |ev| switch (ev) { ... }
+```
+codec  →  tunnel  →  socks5  →  (io)  →  cli
+线原语    通用隧道    SOCKS5 应用          薄 binary
 ```
 
-公开 API 分三层次：`run`/`Config`（开箱即用）、`Session`/`Event`（自带 I/O 模型）、
-`codec`/`socks5`/`wire`（只要协议原语）。详见 [docs/design.md §3.1](docs/design.md)。
+最值得复用的是**隧道层**：它应用无关，给它一条又脏又字符化的载体（ssh stdio），
+还你若干条干净、可靠、有序、带流控的字节流。它不知道什么是 SOCKS5——
+SOCKS5 只是建在它上面的第一个应用。你可以拿同一条隧道去跑反向转发、文件传输、RPC。
+
+核心是 **sans-io** 的：喂它字节和时间，它吐出要发的字节和事件，不碰 socket，
+所以能塞进任何 I/O 模型（poll / epoll / io_uring / 异步 / wasm）。
+
+```zig
+const smodem = @import("smodem");
+
+// 开箱即用：起一个完整 SOCKS5 隧道
+try smodem.run(alloc, .{ .listen_port = 1080, .target = "user@host" });
+
+// 或者只取通用隧道，自己接 I/O、自己定义要跑的应用：
+var t = try smodem.Tunnel.init(alloc, .{}, .client);
+try t.recv(bytes_from_ssh);
+const id = try t.open(my_metadata);       // 元数据对隧道不透明
+while (t.nextEvent()) |ev| switch (ev) { ... }
+```
+
+公开 API 分四层次：`run`/`Config`（开箱即用）、`Tunnel`/`Event`（通用隧道，
+自带 I/O 模型）、`socks5`（SOCKS5↔隧道映射）、`codec`（协议原语）。
+详见 [docs/design.md §3.1](docs/design.md)。
 
 状态：设计完成，实现进行中。

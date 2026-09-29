@@ -31,8 +31,19 @@
 
 ## 3. 目录结构
 
-分成**三层，边界即依赖方向**：核心库不依赖 I/O，I/O 运行时不依赖 CLI，
-CLI 只是接线。目录直接画出这条边界（详见 §3.1 库 API 与复用边界）。
+分成**四层，边界即依赖方向**，自底向上：
+
+```
+codec   →  tunnel  →  socks5  →  (io) →  cli
+线原语     通用隧道    SOCKS5 应用          薄 binary
+```
+
+核心是把**隧道**和**在隧道上跑的 SOCKS5** 分开：隧道是**应用无关**的——
+它只提供"两个对端之间的多路复用可靠流"，对 OPEN 的元数据、UDP 的载荷
+一律当**不透明字节**，不知道什么是地址、什么是 SOCKS5。SOCKS5 只是建在它上面的
+第一个应用；别人可以拿同一个隧道去做反向转发、文件传输、RPC。
+
+前三层（codec/tunnel/socks5）都是 **sans-io、零 syscall**；`io/` 才碰操作系统。
 
 ```
 build.zig                 暴露库模块 "smodem" + 薄可执行 "smodem" + release 目标
@@ -41,30 +52,37 @@ docs/                     protocol.md / design.md / decisions.md / usage.md
 
 src/
   root.zig                ← 库的唯一公开入口。别人 @import("smodem") 拿到的就是它，
-                            只 re-export 稳定 API（§3.1），内部模块不外泄
+                            只 re-export 稳定 API（§3.1），内部分层不外泄
+  sansio.zig              ← sans-io 层聚合根（codec+tunnel+socks5），freestanding check 编它
 
-  core/                   ← 【第一层】sans-io 内核。零 syscall，可 freestanding 编译
-    codec/
-      encoding.zig          RAW/ESC/B64/B32 编解码器、冲刷换行、SS 重同步（哨兵参数化）
-      frame.zig             逻辑帧编解码（头 + payload + CRC32 帧尾）、类型与常量
-      address.zig           RFC 1928 地址块编解码
-      crc32.zig             CRC-32/ISO-HDLC（探针与帧尾共用）
-      derive.zig            由 key 派生 token 与哨兵（SHA256 + BASE32，std.crypto）
-    handshake.zig         引导/HELLO/降档探针/冲刷探针——全部是纯状态机
-    session.zig           会话引擎：喂字节+时间 → 出字节+事件（sans-io 的门面）
-    stream.zig            TCP 流状态机、双层窗口
-    udp.zig               UDP 关联状态：丢弃队列、来源校验规则（不含 socket）
+  codec/                  ← 第零层：线格式原语。纯计算
+    encoding.zig            RAW/ESC/B64/B32 编解码器、冲刷换行、SS 重同步（哨兵参数化）
+    frame.zig              逻辑帧编解码（头 + payload + CRC32 帧尾）、类型与常量
+    address.zig            RFC 1928 地址块编解码（供 socks5 层用；隧道不碰）
+    crc32.zig             CRC-32/ISO-HDLC（探针与帧尾共用）
+    derive.zig            由 key 派生 token 与哨兵（SHA256 + BASE32，std.crypto）
+
+  tunnel/                 ← 第一层：通用多路复用隧道。应用无关，一个 stream 抽象
+    tunnel.zig             Tunnel 门面：喂字节+时间 → 出字节+事件（§3.2）
+    handshake.zig         引导/HELLO/降档探针/冲刷探针——纯状态机
+    stream.zig            单条流状态机、双层窗口、半关闭（payload、open 元数据皆不透明）
+    datagram.zig          不可靠数据报通道：丢弃队列（载荷不透明）
     scheduler.zig         出站 round-robin + 控制帧优先
-    socks5.zig            SOCKS5 服务端解析器（增量式，含 UDP 头）——纯状态机
 
-  io/                     ← 【第二层】POSIX I/O 运行时。可选：别人可整个不用
+  socks5/                 ← 第二层：SOCKS5 语义，建在隧道上
+    wire.zig              SOCKS5 报文解析（增量式，CONNECT / UDP 头）——纯状态机
+    app.zig              把 SOCKS5 ↔ 隧道流对接：open 元数据 = 地址块，
+                          open_err 码 = REP 码，UDP 载荷 = 地址块+数据（协议 §8·§9）
+
+  io/                     ← 第三层（可选）：POSIX I/O 运行时。别人可整个不用
     poller.zig            poll(2) 事件循环封装
     tty.zig               isatty / cfmakeraw / 恢复
     pipe.zig              非阻塞读写、部分写处理
     transport.zig         传输命令驱动：命令/交互/自定义三档（协议 §12），拉起 ssh
-    runtime.zig           把 core.Session 接到真实 fd 上，run(config) 的所在
+    connector.zig         远端侧：按地址 connect(2)、UDP 中继 socket
+    runtime.zig           把 Tunnel + socks5.app 接到真实 fd，run(config) 的所在
 
-  cli/                    ← 【第三层】薄 binary
+  cli/                    ← 第四层：薄 binary
     main.zig              解析 argv → 建 Config → 调 io.runtime.run → 错误映射退出码
     args.zig             参数解析（-p / --key / --armor / -- 透传 …）
 
@@ -72,53 +90,112 @@ tests/
   encoding_test.zig       四种编码往返 + 不变量(含派生哨兵) + 坏管道模拟
   derive_test.zig         key 派生 token/哨兵的确定性与安全性
   frame_test.zig          帧编解码 + 分片 + 畸形输入 + fuzz
-  socks5_test.zig         SOCKS5 解析器 + 逐字节喂入 + UDP 头
-  session_test.zig        会话引擎：握手、窗口、半关闭、降档（纯内存，无 fd）
-  udp_test.zig            UDP 关联生命周期、丢弃策略、来源校验
-  freestanding_test.zig   断言 core/ 能对 freestanding 目标编译（守住"零 syscall"）
+  tunnel_test.zig         隧道引擎：握手、流、窗口、半关闭、降档、重同步（纯内存，无 fd）
+  datagram_test.zig       数据报通道：丢弃策略、生命周期
+  socks5_test.zig         SOCKS5 解析器 + 逐字节喂入 + UDP 头；app 层地址/错误码映射
   e2e_test.zig            端到端：两个真实进程 + socketpair + 真实 TCP/UDP
 ```
 
-依赖方向是**单向**的：`cli → io → core`，`core` 谁都不依赖。
-任何一处 `core/` 里出现 `std.posix` / `std.net` / `std.process`，
-`freestanding_test.zig` 就会编译失败——这条红线由编译器守，不靠自觉。
+依赖方向**单向**：`cli → io → socks5 → tunnel → codec`，下层从不认识上层。
+尤其**隧道不认识 SOCKS5**：`grep -r socks tunnel/` 必须为空。
+sans-io 三层里任何一处出现 `std.posix` / `std.net` / `std.process`，
+`sansio-freestanding-check`（对 wasm32-freestanding 编译 `sansio.zig`）就会失败——
+这条红线由编译器守，不靠自觉。
+
+### 3.2 隧道层：一个应用无关的 stream 抽象
+
+隧道是本库最值得单独复用的一层。它的心智模型：
+
+> 给它一条**又脏又不可靠字符化**的载体（ssh stdio），
+> 它还给你**若干条干净、可靠、有序、带流控的字节流**，外加不可靠数据报通道。
+> 至于流里跑什么、开流时那段元数据是什么意思——它**不问**。
+
+sans-io 门面（`tunnel/tunnel.zig`）：
+
+```zig
+pub const Tunnel = struct {
+    pub fn init(alloc, config, role: Role) !Tunnel
+    pub fn deinit(self) void
+
+    // —— 与脏载体之间搬字节 ——
+    pub fn recv(self, from_wire: []const u8) Error!void   // 喂入收到的字节
+    pub fn send(self, into_wire: []u8) usize              // 取出要发的字节
+    pub fn tick(self, now_ms: u64) Error!void             // 保活、超时、探针推进
+    pub fn nextEvent(self) ?Event                          // 取一条事件
+
+    // —— 流操作（元数据、错误码对隧道都不透明）——
+    pub fn open(self, metadata: []const u8) Error!StreamId
+    pub fn accept(self, id: StreamId, metadata: []const u8) Error!void
+    pub fn reject(self, id: StreamId, code: u8) Error!void
+    pub fn write(self, id: StreamId, bytes: []const u8) Error!usize  // 受窗口限制
+    pub fn closeWrite(self, id: StreamId) Error!void                 // 半关闭 = FIN
+    pub fn reset(self, id: StreamId, reason: u8) Error!void
+
+    // —— 数据报通道（不可靠，载荷不透明）——
+    pub fn openDatagram(self, metadata: []const u8) Error!StreamId
+    pub fn sendDatagram(self, id: StreamId, payload: []const u8) Error!void
+};
+
+pub const Event = union(enum) {
+    ready,                                              // 握手+探针完成，可开流
+    stream_open:  struct { id: StreamId, metadata: []const u8 }, // 对端开流
+    stream_accept:struct { id: StreamId, metadata: []const u8 }, // 我方 open 被接受
+    stream_reject:struct { id: StreamId, code: u8 },
+    stream_data:  struct { id: StreamId, bytes: []const u8 },
+    stream_writable: StreamId,                          // 窗口打开，可继续写
+    stream_eof:   StreamId,                             // 对端半关闭
+    stream_reset: struct { id: StreamId, reason: u8 },
+    datagram:     struct { id: StreamId, payload: []const u8 },
+    log:          struct { level: LogLevel, msg: []const u8 }, // 诊断，不打印
+    closed,
+};
+```
+
+`metadata` 与 `code` 是 `[]const u8` / `u8`，隧道原样搬运。
+SOCKS5 层（`socks5/app.zig`）才把 `metadata` 当作 RFC 1928 地址块解析、
+把 `code` 当作 SOCKS5 REP 码、把数据报载荷当作"地址块 + 数据"。
+换句话说，协议 §8·§9 那些"地址""错误码"的语义**全在第二层**，第一层只有字节。
 
 ### 3.1 库 API 与复用边界
 
-别人 `@import("smodem")` 只看见 `root.zig` re-export 的这几样，分三个层次，
-按"想复用多少"各取所需：
+别人 `@import("smodem")` 只看见 `root.zig` re-export 的这几样，按"想复用多少"
+分四个层次各取所需。**注意隧道（层次二）独立于 SOCKS5（层次三之上）**——
+想用这条脏链路多路复用隧道去跑别的应用的人，只取 `Tunnel` 即可：
 
 ```zig
 // 层次一：开箱即用（薄 binary 走的就是这条）
-pub const Config = io.runtime.Config;      // 约定大于配置，Config{} 即默认可用
-pub fn run(alloc, config) Error!void       // 起一个完整隧道，阻塞直到结束
+pub const Config = io.Config;              // 约定大于配置，Config{} 即默认可用
+pub fn run(alloc, config) Error!void       // 起一个完整 SOCKS5 隧道，阻塞直到结束
 
-// 层次二：sans-io 引擎（想用自己的 I/O 模型的人走这条）
-pub const Session = core.Session;          // 喂字节+时间，出字节+事件，不碰 fd
-pub const Event = core.Event;              // stream_open / data / close / log / ready …
-pub const Role = core.Role;                // .client / .server
+// 层次二：通用隧道引擎（想在脏链路上跑自己的应用的人走这条）——不含任何 SOCKS5
+pub const Tunnel = tunnel.Tunnel;          // 喂字节+时间，出流/数据报事件，不碰 fd
+pub const Event = tunnel.Event;            // stream_open / data / eof / datagram / log …
+pub const Role = tunnel.Role;              // .client / .server
 
-// 层次三：协议原语（只想要线格式的人走这条）
-pub const codec = core.codec;              // encoding / frame / address / crc32 / derive
-pub const socks5 = core.socks5;            // 单独的 SOCKS5 解析器
-pub const wire = core.wire;                // 常量：版本、帧类型、默认窗口 …
+// 层次三：SOCKS5 语义（想自带 I/O、但复用 SOCKS5↔隧道映射的人）
+pub const socks5 = @import("socks5");      // wire 解析 + app 映射（建在 Tunnel 上）
+
+// 层次四：协议原语（只想要线格式的人）
+pub const codec = ...;                     // encoding / frame / address / crc32 / derive
 ```
 
-三条纪律让它"能被别人安心复用"，也是 code review 的硬标准：
+四条纪律让它"能被别人安心复用"，也是 code review 的硬标准：
 
 1. **调用方给 allocator。** 库内不藏全局分配器，任何分配都收 `std.mem.Allocator`。
 2. **库不打印、不退出。** 没有 `std.debug.print`，没有 `std.process.exit`。
    诊断（探针失败、降档、重同步计数）作为 `Event.log{ level, msg }` **返回**给调用方，
    由调用方决定写去哪。退出码是 `cli/` 把 `Error` 翻译出来的，不是库的事。
-3. **sans-io 内核零 syscall。** `core/` 只做纯计算，见上面那条编译期红线。
+3. **sans-io 三层零 syscall。** codec/tunnel/socks5 只做纯计算，见上面那条编译期红线。
+4. **隧道不认识 SOCKS5。** open 元数据、数据报载荷、错误码在隧道层都是不透明字节；
+   任何"这是个地址""这是 REP 码"的解释只能出现在 socks5 层及以上。
 
-`io/runtime.zig` 是"电池"——把 `Session` 接到 poll 循环和真实 socket 上，
+`io/runtime.zig` 是"电池"——把 `Tunnel` + `socks5.app` 接到 poll 循环和真实 socket，
 并把 `Event.log` 默认写到 stderr。想要不同 I/O 模型（epoll、io_uring、异步框架、
-甚至编译进浏览器 wasm）的人，跳过 `io/`，直接驱动 `Session` 即可。
+甚至编译进浏览器 wasm）的人，跳过 `io/`，直接驱动 `Tunnel` 即可。
 
 ## 4. 并发模型：单线程事件循环
 
-> 本节讲的是 `io/runtime.zig` 这一层——**内核（`core/`）本身不含任何并发或 I/O**，
+> 本节讲的是 `io/runtime.zig` 这一层——**sans-io 三层（codec/tunnel/socks5）本身不含任何并发或 I/O**，
 > 它只是被这个循环喂字节、要字节。换一个 I/O 模型，本节整段可以另写，内核不动。
 
 `io/runtime.zig` 用一个线程、一个 `poll(2)` 循环，管这些 fd：
@@ -320,7 +397,7 @@ my_exe.root_module.addImport("smodem", smodem);
 // 代码里：const smodem = @import("smodem"); try smodem.run(alloc, .{});
 ```
 
-他们只会拿到 `root.zig` 暴露的稳定 API（§3.1），`core/` `io/` `cli/` 的内部结构
+他们只会拿到 `root.zig` 暴露的稳定 API（§3.1），`codec/` `tunnel/` `socks5/` `io/` `cli/` 的内部结构
 可以随便重构而不惊动下游——这正是"薄 binary + 可复用库"要买的东西。
 
 ### 8.2 编译要求

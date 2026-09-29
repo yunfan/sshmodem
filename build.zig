@@ -63,9 +63,9 @@ pub fn build(b: *std.Build) void {
         .os_tag = .freestanding,
     });
     const core_check = b.addObject(.{
-        .name = "core-freestanding-check",
+        .name = "sansio-freestanding-check",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/core/root.zig"),
+            .root_source_file = b.path("src/sansio.zig"),
             .target = freestanding,
             .optimize = .ReleaseSafe,
         }),
