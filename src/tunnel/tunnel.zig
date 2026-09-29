@@ -761,18 +761,46 @@ pub const Tunnel = struct {
         if (ok) {
             try self.logChosen(self.probe_cand);
             try self.txChosen(self.probe_cand);
-        } else switch (self.probe_cand) {
+            return;
+        }
+        // 不透明：打逐字节诊断（协议 §4.4），再降档。
+        try self.diagnose(rx[0..@min(rx.len, rx_len)]);
+        switch (self.probe_cand) {
             .raw => try self.startTxProbe(.esc),
-            .esc => {
+            else => {
                 // ESC 也不行：回落 B64（握手已证明它能过，不必再测）。
                 try self.logChosen(.b64);
                 try self.txChosen(.b64);
             },
-            else => {
-                try self.logChosen(.b64);
-                try self.txChosen(.b64);
-            },
         }
+    }
+
+    /// 逐字节诊断（协议 §4.4）：把线到底怎么坏的说清楚，而不是只说"校验错误"。
+    fn diagnose(self: *Tunnel, received: []const u8) Error!void {
+        const expected = self.probe_expected[0..self.probe_expected_len];
+        const dir = if (self.role == .client) "client->server" else "server->client";
+        const delta: i64 = @as(i64, @intCast(received.len)) - @as(i64, @intCast(expected.len));
+        const m = @min(received.len, expected.len);
+        var off: usize = 0;
+        while (off < m and received[off] == expected[off]) : (off += 1) {}
+        var cause: []const u8 = "bytes altered in transit";
+        if (delta > 0) {
+            cause = "bytes INSERTED (likely ONLCR turning LF into CR LF)";
+        } else if (delta < 0) {
+            cause = "bytes DROPPED (likely ISIG/IXON/ICANON eating control chars)";
+        } else if (off < m and (expected[off] & 0x7F) == received[off] and expected[off] >= 0x80) {
+            cause = "8th bit STRIPPED (likely ISTRIP)";
+        }
+        var buf: [320]u8 = undefined;
+        const msg = if (off < m)
+            std.fmt.bufPrint(&buf, "probe {s} not 8-bit clean ({s}): sent={d} recv={d} (delta {d}); first diff @{d} sent=0x{X:0>2} got=0x{X:0>2} — {s}", .{
+                @tagName(self.probe_cand), dir, expected.len, received.len, delta, off, expected[off], received[off], cause,
+            }) catch return
+        else
+            std.fmt.bufPrint(&buf, "probe {s} not 8-bit clean ({s}): sent={d} recv={d} (delta {d}); length changed — {s}", .{
+                @tagName(self.probe_cand), dir, expected.len, received.len, delta, cause,
+            }) catch return;
+        try self.log(.warn, msg);
     }
 
     fn logChosen(self: *Tunnel, enc: Encoding) Error!void {
