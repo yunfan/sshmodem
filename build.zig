@@ -27,6 +27,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .link_libc = true, // io 层用 std.c（socket/getaddrinfo/spawn）
             .imports = &.{.{ .name = "smodem", .module = mod }},
         }),
     });
@@ -85,14 +86,22 @@ pub fn build(b: *std.Build) void {
     for (targets) |q| {
         var query = q;
         query.cpu_model = .baseline;
+        const rtarget = b.resolveTargetQuery(query);
+        // 每个目标建独立的库模块——模块 target 不能跨平台复用。
+        const rmod = b.createModule(.{
+            .root_source_file = b.path("src/root.zig"),
+            .target = rtarget,
+            .optimize = .ReleaseSafe,
+        });
         const rexe = b.addExecutable(.{
             .name = "smodem",
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/main.zig"),
-                .target = b.resolveTargetQuery(query),
+                .target = rtarget,
                 .optimize = .ReleaseSafe,
                 .strip = true, // release 产物要 scp 到跳板机，去掉调试信息减体积
-                .imports = &.{.{ .name = "smodem", .module = mod }},
+                .link_libc = true,
+                .imports = &.{.{ .name = "smodem", .module = rmod }},
             }),
         });
         const triple = q.zigTriple(b.allocator) catch @panic("oom");

@@ -1,0 +1,542 @@
+//! POSIX 运行时（链接 libc）：把通用 Tunnel + socks5 报文层接到真实 fd 上。
+//! 单线程 poll(2) 循环（决策 D10）。两种模式：
+//!   - local：本地起 SOCKS5 监听，拉起 ssh 传输，作 Tunnel client。
+//!   - serve：远端用 stdin/stdout 作传输，作 Tunnel server，按需 connect 目标。
+//!
+//! sans-io 的 Tunnel/ socks5 不在这里；这里只搬字节、管 fd、做背压。
+
+const std = @import("std");
+const posix = std.posix;
+const Allocator = std.mem.Allocator;
+const net = @import("net.zig");
+const child = @import("child.zig");
+const smodem = @import("smodem");
+const Tunnel = smodem.Tunnel;
+const socks5 = smodem.socks5.wire;
+const address = smodem.codec.address;
+
+const POLLIN = posix.POLL.IN;
+const POLLOUT = posix.POLL.OUT;
+
+fn nowMs() i64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(posix.CLOCK.MONOTONIC, &ts);
+    return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1_000_000);
+}
+
+pub const Mode = enum { local, serve };
+
+pub const Config = struct {
+    mode: Mode = .local,
+    listen_ip: [4]u8 = .{ 127, 0, 0, 1 },
+    listen_port: u16 = 1080,
+    /// 传输命令 argv（local 模式）。默认由 CLI 拼 "ssh -T <target> smodem serve"。
+    transport_argv: []const [:0]const u8 = &.{},
+    tunnel: smodem.tunnel.Config = .{},
+    verbose: bool = true,
+};
+
+pub const RunError = error{ SetupFailed, TransportFailed } || net.IoError || Allocator.Error || smodem.tunnel.Error;
+
+const ConnPhase = enum { greeting, request, awaiting, connecting, piping, closing };
+
+const Conn = struct {
+    fd: net.fd_t,
+    stream_id: u32 = 0,
+    phase: ConnPhase,
+    hs_buf: [1024]u8 = undefined,
+    hs_len: usize = 0,
+    t2s: std.ArrayList(u8) = .empty, // 待写给 socket 的字节（tunnel→socket 或握手应答）
+    s2t: std.ArrayList(u8) = .empty, // 从 socket 读到但隧道尚未接受的字节（背压暂存）
+    want_read: bool = true, // 是否还想从 socket 读（背压时关掉）
+    sock_eof: bool = false,
+    dead: bool = false,
+
+    fn deinit(self: *Conn, alloc: Allocator) void {
+        self.t2s.deinit(alloc);
+        self.s2t.deinit(alloc);
+    }
+};
+
+const Runtime = struct {
+    alloc: Allocator,
+    cfg: Config,
+    tunnel: Tunnel,
+    wire_in: net.fd_t,
+    wire_out: net.fd_t,
+    listen_fd: ?net.fd_t = null,
+    wire_obuf: std.ArrayList(u8) = .empty, // tunnel.send 出来但还没写进 wire 的字节
+    conns: std.ArrayList(*Conn) = .empty,
+    by_stream: std.AutoHashMap(u32, *Conn),
+    io_buf: [65536]u8 = undefined,
+    running: bool = true,
+
+    fn log(self: *Runtime, comptime fmt: []const u8, args: anytype) void {
+        if (self.cfg.verbose) std.debug.print("smodem: " ++ fmt ++ "\n", args);
+    }
+
+    fn addConn(self: *Runtime, conn: *Conn) !void {
+        try self.conns.append(self.alloc, conn);
+    }
+
+    fn dropConn(self: *Runtime, conn: *Conn) void {
+        if (conn.stream_id != 0) _ = self.by_stream.remove(conn.stream_id);
+        net.close(conn.fd);
+        for (self.conns.items, 0..) |cptr, i| {
+            if (cptr == conn) {
+                _ = self.conns.swapRemove(i);
+                break;
+            }
+        }
+        conn.deinit(self.alloc);
+        self.alloc.destroy(conn);
+    }
+
+    // 把 tunnel 要发的字节抽到 wire_obuf。
+    fn pumpTunnelOut(self: *Runtime) !void {
+        while (true) {
+            const n = self.tunnel.send(&self.io_buf);
+            if (n == 0) break;
+            try self.wire_obuf.appendSlice(self.alloc, self.io_buf[0..n]);
+        }
+    }
+
+    fn flushWire(self: *Runtime) void {
+        if (self.wire_obuf.items.len == 0) return;
+        switch (net.writeFd(self.wire_out, self.wire_obuf.items)) {
+            .n => |w| {
+                if (w > 0) {
+                    const rem = self.wire_obuf.items.len - w;
+                    if (rem > 0) std.mem.copyForwards(u8, self.wire_obuf.items[0..rem], self.wire_obuf.items[w..]);
+                    self.wire_obuf.shrinkRetainingCapacity(rem);
+                }
+            },
+            .again => {},
+            .eof, .err => self.running = false,
+        }
+    }
+
+    fn queueToSock(self: *Runtime, conn: *Conn, bytes: []const u8) !void {
+        try conn.t2s.appendSlice(self.alloc, bytes);
+    }
+
+    fn flushSock(self: *Runtime, conn: *Conn) void {
+        if (conn.t2s.items.len == 0) return;
+        switch (net.writeFd(conn.fd, conn.t2s.items)) {
+            .n => |w| {
+                if (w > 0) {
+                    const rem = conn.t2s.items.len - w;
+                    if (rem > 0) std.mem.copyForwards(u8, conn.t2s.items[0..rem], conn.t2s.items[w..]);
+                    conn.t2s.shrinkRetainingCapacity(rem);
+                    if (conn.phase == .piping and conn.stream_id != 0) {
+                        self.tunnel.consume(conn.stream_id, @intCast(w)) catch {};
+                    }
+                }
+            },
+            .again => {},
+            .eof, .err => conn.dead = true,
+        }
+    }
+};
+
+// ===================== 处理隧道事件 =====================
+
+fn handleTunnelEvents(rt: *Runtime) !void {
+    while (rt.tunnel.nextEvent()) |ev| switch (ev) {
+        .ready => rt.log("ready (encoding fixed={s})", .{@tagName(rt.cfg.tunnel.encoding)}),
+        .log => |l| if (rt.cfg.verbose) rt.log("[{s}] {s}", .{ @tagName(l.level), l.msg }),
+        .stream_open => |x| try onStreamOpen(rt, x.id, x.metadata), // serve 侧：对端要开流
+        .stream_accept => |x| try onStreamAccept(rt, x.id), // local 侧：远端接受了 CONNECT
+        .stream_reject => |x| try onStreamReject(rt, x.id, x.code),
+        .stream_data => |x| try onStreamData(rt, x.id, x.bytes),
+        .stream_writable => {}, // 背压恢复：下一轮 poll 会重新尝试读 socket
+        .stream_eof => |id| try onStreamEof(rt, id),
+        .stream_reset => |x| onStreamReset(rt, x.id),
+        .closed => rt.running = false,
+    };
+}
+
+fn connByStream(rt: *Runtime, id: u32) ?*Conn {
+    return rt.by_stream.get(id);
+}
+
+// serve 侧：对端开流，metadata 是地址块 → 解析 → connect 目标。
+fn onStreamOpen(rt: *Runtime, id: u32, metadata: []const u8) !void {
+    const dec = address.decode(metadata) catch {
+        try rt.tunnel.reject(id, @intFromEnum(socks5.Rep.general));
+        return;
+    };
+    var ip4: [4]u8 = undefined;
+    switch (dec.addr.host) {
+        .ipv4 => |a| ip4 = a,
+        .domain => |d| {
+            var hostbuf: [256]u8 = undefined;
+            if (d.len >= hostbuf.len) {
+                try rt.tunnel.reject(id, @intFromEnum(socks5.Rep.general));
+                return;
+            }
+            @memcpy(hostbuf[0..d.len], d);
+            hostbuf[d.len] = 0;
+            ip4 = net.resolve4(hostbuf[0..d.len :0], dec.addr.port) catch {
+                try rt.tunnel.reject(id, @intFromEnum(socks5.Rep.host_unreach));
+                return;
+            };
+        },
+        .ipv6 => {
+            try rt.tunnel.reject(id, @intFromEnum(socks5.Rep.atyp_unsupported));
+            return;
+        },
+    }
+    const cr = net.connectTcp4(ip4, dec.addr.port) catch {
+        try rt.tunnel.reject(id, @intFromEnum(socks5.Rep.general));
+        return;
+    };
+    const fd = switch (cr) {
+        .fd => |f| f,
+        .failed => |e| {
+            try rt.tunnel.reject(id, @intFromEnum(mapErrno(e)));
+            return;
+        },
+    };
+    const conn = try rt.alloc.create(Conn);
+    conn.* = .{ .fd = fd, .stream_id = id, .phase = .connecting };
+    try rt.addConn(conn);
+    try rt.by_stream.put(id, conn);
+}
+
+// local 侧：远端接受了 CONNECT → 给浏览器回 SOCKS5 成功。
+fn onStreamAccept(rt: *Runtime, id: u32) !void {
+    const conn = connByStream(rt, id) orelse return;
+    var rep: [32]u8 = undefined;
+    const n = socks5.buildReply(&rep, .success, socks5.null_bind);
+    try rt.queueToSock(conn, rep[0..n]);
+    conn.phase = .piping;
+}
+
+fn onStreamReject(rt: *Runtime, id: u32, code: u8) !void {
+    const conn = connByStream(rt, id) orelse return;
+    var rep: [32]u8 = undefined;
+    const n = socks5.buildError(&rep, @enumFromInt(code));
+    try rt.queueToSock(conn, rep[0..n]);
+    conn.phase = .closing; // 冲刷完应答后关闭
+}
+
+fn onStreamData(rt: *Runtime, id: u32, bytes: []const u8) !void {
+    const conn = connByStream(rt, id) orelse return;
+    rt.queueToSock(conn, bytes) catch {
+        conn.dead = true;
+        return;
+    };
+    rt.flushSock(conn);
+}
+
+fn onStreamEof(rt: *Runtime, id: u32) !void {
+    const conn = connByStream(rt, id) orelse return;
+    // 对端不再发数据：待 t2s 冲刷完，关闭 socket 写端。
+    net.shutdownWrite(conn.fd);
+}
+
+fn onStreamReset(rt: *Runtime, id: u32) void {
+    const conn = connByStream(rt, id) orelse return;
+    conn.dead = true;
+}
+
+// ===================== SOCKS5 握手（local） =====================
+
+fn driveSocks5(rt: *Runtime, conn: *Conn) !void {
+    switch (net.readFd(conn.fd, conn.hs_buf[conn.hs_len..])) {
+        .n => |r| conn.hs_len += r,
+        .again => return,
+        .eof, .err => {
+            conn.dead = true;
+            return;
+        },
+    }
+    if (conn.phase == .greeting) {
+        const g = socks5.parseGreeting(conn.hs_buf[0..conn.hs_len]) catch {
+            conn.dead = true;
+            return;
+        };
+        switch (g) {
+            .need_more => return,
+            .ok => |gr| {
+                if (!gr.no_auth) {
+                    try rt.queueToSock(conn, &socks5.methodReply(socks5.auth_unacceptable));
+                    conn.phase = .closing;
+                    return;
+                }
+                try rt.queueToSock(conn, &socks5.methodReply(socks5.auth_none));
+                // 移除已消费的问候字节
+                shiftHs(conn, gr.consumed);
+                conn.phase = .request;
+                if (conn.hs_len > 0) try driveSocks5Request(rt, conn);
+            },
+        }
+    } else if (conn.phase == .request) {
+        try driveSocks5Request(rt, conn);
+    }
+}
+
+fn driveSocks5Request(rt: *Runtime, conn: *Conn) !void {
+    const r = socks5.parseRequest(conn.hs_buf[0..conn.hs_len]) catch {
+        conn.dead = true;
+        return;
+    };
+    switch (r) {
+        .need_more => return,
+        .ok => |req| {
+            if (req.cmd != .connect) {
+                var rep: [32]u8 = undefined;
+                const n = socks5.buildError(&rep, .cmd_unsupported);
+                try rt.queueToSock(conn, rep[0..n]);
+                conn.phase = .closing;
+                return;
+            }
+            const id = try rt.tunnel.open(req.addr_block);
+            conn.stream_id = id;
+            conn.phase = .awaiting;
+            try rt.by_stream.put(id, conn);
+            shiftHs(conn, req.consumed);
+        },
+    }
+}
+
+fn shiftHs(conn: *Conn, consumed: usize) void {
+    const rem = conn.hs_len - consumed;
+    if (rem > 0) std.mem.copyForwards(u8, conn.hs_buf[0..rem], conn.hs_buf[consumed..conn.hs_len]);
+    conn.hs_len = rem;
+}
+
+// ===================== 数据泵（piping） =====================
+
+fn pumpConnRead(rt: *Runtime, conn: *Conn) !void {
+    if (conn.phase != .piping or conn.stream_id == 0) return;
+    var buf: [16384]u8 = undefined;
+    switch (net.readFd(conn.fd, &buf)) {
+        .n => |r| {
+            const accepted = try rt.tunnel.write(conn.stream_id, buf[0..r]);
+            if (accepted < r) {
+                // 隧道窗口/背压未全收：剩余存入 s2t，停读 socket，等窗口打开再喂。
+                try conn.s2t.appendSlice(rt.alloc, buf[accepted..r]);
+                conn.want_read = false;
+            }
+        },
+        .again => {},
+        .eof => {
+            conn.sock_eof = true;
+            if (conn.s2t.items.len == 0) try rt.tunnel.closeWrite(conn.stream_id);
+            conn.want_read = false;
+        },
+        .err => conn.dead = true,
+    }
+}
+
+// 背压恢复：把暂存的 s2t 再喂给隧道。
+fn retryConnWrite(rt: *Runtime, conn: *Conn) !void {
+    if (conn.stream_id == 0 or conn.s2t.items.len == 0) return;
+    const accepted = try rt.tunnel.write(conn.stream_id, conn.s2t.items);
+    if (accepted > 0) {
+        const rem = conn.s2t.items.len - accepted;
+        if (rem > 0) std.mem.copyForwards(u8, conn.s2t.items[0..rem], conn.s2t.items[accepted..]);
+        conn.s2t.shrinkRetainingCapacity(rem);
+        if (rem == 0) {
+            if (conn.sock_eof) {
+                try rt.tunnel.closeWrite(conn.stream_id);
+            } else {
+                conn.want_read = true;
+            }
+        }
+    }
+}
+
+// ===================== 事件循环 =====================
+
+fn eventLoop(rt: *Runtime) !void {
+    var pollfds: std.ArrayList(posix.pollfd) = .empty;
+    defer pollfds.deinit(rt.alloc);
+    var last_tick: i64 = nowMs();
+
+    while (rt.running) {
+        try rt.pumpTunnelOut();
+
+        pollfds.clearRetainingCapacity();
+        // wire in
+        try pollfds.append(rt.alloc, .{ .fd = rt.wire_in, .events = POLLIN, .revents = 0 });
+        // wire out
+        if (rt.wire_obuf.items.len > 0)
+            try pollfds.append(rt.alloc, .{ .fd = rt.wire_out, .events = POLLOUT, .revents = 0 });
+        // listen
+        if (rt.listen_fd) |lf|
+            try pollfds.append(rt.alloc, .{ .fd = lf, .events = POLLIN, .revents = 0 });
+        // conns
+        for (rt.conns.items) |conn| {
+            var ev: i16 = 0;
+            if (conn.phase == .greeting or conn.phase == .request) ev |= POLLIN;
+            if (conn.phase == .piping and conn.want_read) ev |= POLLIN;
+            if (conn.t2s.items.len > 0 or conn.phase == .connecting) ev |= POLLOUT;
+            if (ev != 0) try pollfds.append(rt.alloc, .{ .fd = conn.fd, .events = ev, .revents = 0 });
+        }
+
+        _ = posix.poll(pollfds.items, 1000) catch 0;
+
+        // 分发 revents
+        for (pollfds.items) |pfd| {
+            if (pfd.revents == 0) continue;
+            if (pfd.fd == rt.wire_in) {
+                switch (net.readFd(rt.wire_in, &rt.io_buf)) {
+                    .n => |r| try rt.tunnel.recv(rt.io_buf[0..r]),
+                    .again => {},
+                    .eof, .err => rt.running = false,
+                }
+            } else if (pfd.fd == rt.wire_out) {
+                rt.flushWire();
+            } else if (rt.listen_fd != null and pfd.fd == rt.listen_fd.?) {
+                while (net.accept(rt.listen_fd.?)) |cfd| {
+                    const conn = try rt.alloc.create(Conn);
+                    conn.* = .{ .fd = cfd, .phase = .greeting };
+                    try rt.addConn(conn);
+                }
+            } else {
+                // conn fd
+                const conn = findConnByFd(rt, pfd.fd) orelse continue;
+                if (conn.phase == .connecting and (pfd.revents & POLLOUT) != 0) {
+                    const e = net.connectResult(conn.fd);
+                    if (e == posix.E.SUCCESS) {
+                        try rt.tunnel.accept(conn.stream_id, socks5EncodeBind());
+                        conn.phase = .piping;
+                    } else {
+                        try rt.tunnel.reject(conn.stream_id, @intFromEnum(mapErrno(e)));
+                        conn.dead = true;
+                    }
+                    continue;
+                }
+                if ((pfd.revents & POLLIN) != 0) {
+                    if (conn.phase == .greeting or conn.phase == .request) {
+                        try driveSocks5(rt, conn);
+                    } else if (conn.phase == .piping) {
+                        try pumpConnRead(rt, conn);
+                    }
+                }
+                if ((pfd.revents & POLLOUT) != 0) {
+                    rt.flushSock(conn);
+                }
+            }
+        }
+
+        try handleTunnelEvents(rt);
+
+        // 背压恢复：尝试把暂存的 s2t 再喂给隧道
+        for (rt.conns.items) |conn| try retryConnWrite(rt, conn);
+
+        // 冲刷各 socket、清理死连接
+        var i: usize = 0;
+        while (i < rt.conns.items.len) {
+            const conn = rt.conns.items[i];
+            rt.flushSock(conn);
+            const flushed = conn.t2s.items.len == 0;
+            if (conn.dead and flushed) {
+                if (conn.stream_id != 0) rt.tunnel.reset(conn.stream_id, 0) catch {};
+                rt.dropConn(conn);
+                continue;
+            }
+            if (conn.phase == .closing and flushed) {
+                rt.dropConn(conn);
+                continue;
+            }
+            i += 1;
+        }
+
+        // 定期 tick
+        const now = nowMs();
+        if (now - last_tick >= 500) {
+            last_tick = now;
+            rt.tunnel.tick(@intCast(now)) catch |e| {
+                rt.log("tunnel closed: {s}", .{@errorName(e)});
+                rt.running = false;
+            };
+        }
+    }
+}
+
+fn findConnByFd(rt: *Runtime, fd: net.fd_t) ?*Conn {
+    for (rt.conns.items) |conn| if (conn.fd == fd) return conn;
+    return null;
+}
+
+fn socks5EncodeBind() []const u8 {
+    // 远端绑定地址：这里简化回全零 IPv4:0（元数据对隧道不透明，local 侧也不使用）。
+    return &[_]u8{ 0x01, 0, 0, 0, 0, 0, 0 };
+}
+
+fn mapErrno(e: posix.E) socks5.Rep {
+    return switch (e) {
+        posix.E.CONNREFUSED => .refused,
+        posix.E.HOSTUNREACH => .host_unreach,
+        posix.E.NETUNREACH => .net_unreach,
+        posix.E.TIMEDOUT => .ttl_expired,
+        else => .general,
+    };
+}
+
+// ===================== 入口 =====================
+
+pub fn run(alloc: Allocator, cfg: Config) RunError!void {
+    switch (cfg.mode) {
+        .local => try runLocal(alloc, cfg),
+        .serve => try runServe(alloc, cfg),
+    }
+}
+
+fn runLocal(alloc: Allocator, cfg: Config) RunError!void {
+    const listen_fd = try net.listenTcp(cfg.listen_ip, cfg.listen_port);
+    errdefer net.close(listen_fd);
+
+    var argv_buf: [1][*:null]const ?[*:0]const u8 = undefined;
+    const ch = child.spawn(cfg.transport_argv, &argv_buf) catch return error.TransportFailed;
+
+    var rt = Runtime{
+        .alloc = alloc,
+        .cfg = cfg,
+        .tunnel = try Tunnel.init(alloc, cfg.tunnel, .client),
+        .wire_in = ch.stdout_fd,
+        .wire_out = ch.stdin_fd,
+        .listen_fd = listen_fd,
+        .by_stream = std.AutoHashMap(u32, *Conn).init(alloc),
+    };
+    defer rt.tunnel.deinit();
+    defer rt.wire_obuf.deinit(alloc);
+    defer rt.by_stream.deinit();
+    defer {
+        for (rt.conns.items) |conn| {
+            conn.deinit(alloc);
+            alloc.destroy(conn);
+        }
+        rt.conns.deinit(alloc);
+    }
+    rt.log("local mode: socks5 on {d}.{d}.{d}.{d}:{d}", .{ cfg.listen_ip[0], cfg.listen_ip[1], cfg.listen_ip[2], cfg.listen_ip[3], cfg.listen_port });
+    try eventLoop(&rt);
+}
+
+fn runServe(alloc: Allocator, cfg: Config) RunError!void {
+    net.setNonBlock(0);
+    net.setNonBlock(1);
+    var rt = Runtime{
+        .alloc = alloc,
+        .cfg = cfg,
+        .tunnel = try Tunnel.init(alloc, cfg.tunnel, .server),
+        .wire_in = 0,
+        .wire_out = 1,
+        .by_stream = std.AutoHashMap(u32, *Conn).init(alloc),
+    };
+    defer rt.tunnel.deinit();
+    defer rt.wire_obuf.deinit(alloc);
+    defer rt.by_stream.deinit();
+    defer {
+        for (rt.conns.items) |conn| {
+            conn.deinit(alloc);
+            alloc.destroy(conn);
+        }
+        rt.conns.deinit(alloc);
+    }
+    try eventLoop(&rt);
+}
