@@ -45,10 +45,12 @@ src/
   main.zig                CLI 入口：解析参数，分发到 local / serve
   root.zig                库入口，导出全部模块供测试使用
   protocol/
-    encoding.zig          传输编码层：RAW/ESC/B64 编解码器、冲刷换行、%% 重同步
+    encoding.zig          传输编码层：RAW/ESC/B64/B32 编解码器、冲刷换行、SS 重同步
+                          （哨兵字节参数化，默认 %，加固模式派生）
     frame.zig             逻辑帧编解码（头+payload+CRC32 帧尾）、类型定义、常量
     address.zig           RFC 1928 地址块编解码
-    handshake.zig         SYNC 扫描、HELLO 协商、逐级降档探针、冲刷探针
+    handshake.zig         引导序列（token 可派生）、HELLO 协商、降档探针、冲刷探针
+    derive.zig            由 --key 派生 token 与哨兵（SHA256 + BASE32，std.crypto）
     crc32.zig             CRC-32/ISO-HDLC（探针与帧尾共用）
   mux/
     session.zig           会话状态机、帧分发、保活
@@ -65,7 +67,8 @@ src/
     tty.zig               isatty / cfmakeraw / 恢复
     pipe.zig              非阻塞读写、部分写处理
 tests/
-  encoding_test.zig       三种编码往返 + 不变量 + 坏管道模拟
+  encoding_test.zig       四种编码往返 + 不变量(含派生哨兵) + 坏管道模拟
+  derive_test.zig         --key 派生 token/哨兵的确定性与安全性
   frame_test.zig          帧编解码 + 分片 + 畸形输入 + fuzz
   socks5_test.zig         SOCKS5 解析器 + 逐字节喂入 + UDP 头
   session_test.zig        会话状态机、窗口、半关闭、降档
@@ -173,15 +176,19 @@ smodem -- ssh -J a@b c@d smodem serve # 完全自定义传输命令
 
 这是最该被测狠的一层，因为它是所有诡异 bug 的藏身处。
 
-- **往返**：三种编码，`encode` 后 `decode` 必须得到原值。
-  输入覆盖全 256 字节值、全 `0x0A`、全 `%`、空输入、随机数据。
-- **不变量**：ESC 与 B64 的输出中**必须不含 `%%`**。用穷举 + 随机数据断言。
-  这条不变量塌了，`%%` 就不再是可靠的同步标记，探针边界和引导都会跟着错。
+- **往返**：四种编码（RAW/ESC/B64/B32），`encode` 后 `decode` 必须得到原值。
+  输入覆盖全 256 字节值、全 `0x0A`、全哨兵、空输入、随机数据。
+- **不变量（含派生哨兵）**：ESC/B64/B32 的输出中**必须不含 `SS`**。
+  不只测默认哨兵 `%`，还要**遍历安全字节池里的每一个候选哨兵**跑一遍穷举 + 随机数据。
+  这条不变量塌了，`SS` 就不再是可靠的同步标记，探针边界、引导、重同步全跟着错——
+  而派生哨兵最容易在这里翻车（比如某个哨兵的 `XOR 0x40` 忘了进 ESC 转义集合）。
 - **任意分片**：把编码后的流按 1 字节、2 字节、素数长度、单块等切法喂给解码器，
-  结果必须一致。转义序列和 Base64 四元组跨分片是最容易写错的地方。
-- **畸形输入**：孤立的 `%` 结尾、非法 Base64 字符、`%` 后跟不可能的字节——
+  结果必须一致。转义序列和 base 四元/五元组跨分片是最容易写错的地方。
+- **畸形输入**：孤立的哨兵结尾、非法字母表字符、哨兵后跟不可能的字节——
   必须报错，不得 panic、不得越界。
-- **fuzz**：`std.testing.fuzz` 喂随机字节给三个解码器，要求永不 panic。
+- **派生一致性**（`derive.zig`）：同一 `--key` 必须派生出同一 token 与同一哨兵；
+  不同 key 几乎必然不同；派生出的哨兵**必须落在安全字节池内**（否则不变量无从谈起）。
+- **fuzz**：`std.testing.fuzz` 喂随机字节给四个解码器，要求永不 panic。
 
 ### 7.2 坏管道模拟（`encoding_test.zig`）
 

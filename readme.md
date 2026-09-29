@@ -30,6 +30,10 @@ smodem user@jumphost          # 本地 127.0.0.1:1080 起 SOCKS5
 
 SOCKS5 的 TCP `CONNECT` 和 UDP `ASSOCIATE` 都支持。
 
+握手序列可用 `--key` 派生、`--marker` 指定；`--armor` 提供只用可见字符的加固传输
+（牺牲带宽换对抗性与更低指纹）。**这些默认全关**，且都不是安全机制——
+安全始终来自 SSH。
+
 ## 文档
 
 | 文档 | 内容 |
