@@ -1,0 +1,81 @@
+name: release
+
+# 触发：推送形如 release/vX.Y.Z 的标签。
+#   git tag release/v1.2.3 && git push origin release/v1.2.3
+on:
+  push:
+    tags:
+      - 'release/v*'
+
+permissions:
+  contents: write # 创建 Release、上传产物
+
+env:
+  ZIG_VERSION: "0.16.0"
+  # 0.16.0 linux-x86_64 官方包的 sha256（校验下载完整性）
+  ZIG_SHA256: "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Derive version
+        id: ver
+        run: |
+          # refs/tags/release/vX.Y.Z -> X.Y.Z
+          version="${GITHUB_REF_NAME#release/v}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "building smodem $version (tag $GITHUB_REF_NAME)"
+
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        run: |
+          set -euo pipefail
+          url="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          curl -fsSL -o /tmp/zig.tar.xz "$url"
+          echo "${ZIG_SHA256}  /tmp/zig.tar.xz" | sha256sum -c -
+          mkdir -p "$HOME/zig"
+          tar -xf /tmp/zig.tar.xz -C "$HOME/zig" --strip-components=1
+          echo "$HOME/zig" >> "$GITHUB_PATH"
+
+      - name: Zig version
+        run: zig version
+
+      - name: Test
+        run: zig build test --summary all
+
+      - name: Cross-compile release binaries
+        run: zig build release
+
+      - name: Package artifacts
+        id: pkg
+        run: |
+          set -euo pipefail
+          V="${{ steps.ver.outputs.version }}"
+          mkdir -p dist
+          # 版本对应的源码 tar 包（干净、只含仓库跟踪文件）
+          git archive --format=tar.gz --prefix="smodem-$V/" \
+            -o "dist/smodem-$V-src.tar.gz" HEAD
+          # 各平台二进制打包
+          for d in zig-out/release/*/; do
+            triple="$(basename "$d")"
+            tar -C "$d" -czf "dist/smodem-$V-$triple.tar.gz" smodem
+          done
+          # 汇总校验和
+          ( cd dist && sha256sum *.tar.gz > "smodem-$V-SHA256SUMS.txt" )
+          echo "---- dist ----"
+          ls -la dist
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: smodem ${{ steps.ver.outputs.version }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/*SHA256SUMS.txt
