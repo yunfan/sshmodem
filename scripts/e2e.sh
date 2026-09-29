@@ -4,7 +4,7 @@
 set -u
 BIN="${1:-./zig-out/bin/smodem}"
 PORT=${SMODEM_E2E_PORT:-11080}
-HTTP=18099
+HTTP=$(( 20000 + (RANDOM % 20000) ))
 FAIL=0
 TMP=$(mktemp -d)
 trap 'kill $(jobs -p) 2>/dev/null; rm -rf "$TMP"' EXIT
@@ -23,9 +23,13 @@ check() { # desc expected_code url [outfile]
   if [ "$code" = "$want" ]; then echo "  ok  $desc ($code)"; else echo "  FAIL $desc (got $code want $want)"; FAIL=1; fi
 }
 
-for enc in b64 esc raw b32; do
+for enc in auto b64 esc raw b32; do
   echo "== encoding=$enc =="
-  "$BIN" -q -p "$PORT" --encoding "$enc" -- "$BIN" serve --encoding "$enc" >"$TMP/sm.log" 2>&1 &
+  if [ "$enc" = auto ]; then
+    "$BIN" -q -p "$PORT" -- "$BIN" serve >"$TMP/sm.log" 2>&1 &
+  else
+    "$BIN" -q -p "$PORT" --encoding "$enc" -- "$BIN" serve --encoding "$enc" >"$TMP/sm.log" 2>&1 &
+  fi
   SM=$!
   sleep 1
   check "small ip"   200 "http://127.0.0.1:$HTTP/big.bin" "$TMP/o1"

@@ -46,6 +46,7 @@ fn runMain(init: std.process.Init) !u8 {
     var target: ?[]const u8 = null;
     var remote_cmd: []const u8 = "smodem serve";
     var custom: ?[]const [:0]const u8 = null;
+    var encoding_forced = false;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -69,6 +70,7 @@ fn runMain(init: std.process.Init) !u8 {
             i += 1;
             if (i >= args.len) return usageErr();
             cfg.tunnel.encoding = parseEncoding(args[i]) orelse return usageErr();
+            encoding_forced = true;
         } else if (std.mem.eql(u8, a, "--")) {
             custom = args[i + 1 ..];
             break;
@@ -78,6 +80,9 @@ fn runMain(init: std.process.Init) !u8 {
             return usageErr();
         }
     }
+
+    // 未显式 --encoding 时开启自动降档探针（协议 §4.2），默认体验：干净管道零开销。
+    if (!encoding_forced) cfg.tunnel.auto_probe = true;
 
     if (cfg.mode == .serve) {
         try rt.run(alloc, cfg);

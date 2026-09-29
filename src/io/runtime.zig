@@ -143,7 +143,7 @@ const Runtime = struct {
 
 fn handleTunnelEvents(rt: *Runtime) !void {
     while (rt.tunnel.nextEvent()) |ev| switch (ev) {
-        .ready => rt.log("ready (encoding fixed={s})", .{@tagName(rt.cfg.tunnel.encoding)}),
+        .ready => rt.log("ready (send={s} recv={s})", .{ @tagName(rt.tunnel.txEncoding()), @tagName(rt.tunnel.rxEncoding()) }),
         .log => |l| if (rt.cfg.verbose) rt.log("[{s}] {s}", .{ @tagName(l.level), l.msg }),
         .stream_open => |x| try onStreamOpen(rt, x.id, x.metadata), // serve 侧：对端要开流
         .stream_accept => |x| try onStreamAccept(rt, x.id), // local 侧：远端接受了 CONNECT
@@ -365,8 +365,8 @@ fn eventLoop(rt: *Runtime) !void {
         // wire out
         if (rt.wire_obuf.items.len > 0)
             try pollfds.append(rt.alloc, .{ .fd = rt.wire_out, .events = POLLOUT, .revents = 0 });
-        // listen
-        if (rt.listen_fd) |lf|
+        // listen —— 握手/探针未完成前不接受 SOCKS5 连接（开流需 ready）。
+        if (rt.listen_fd) |lf| if (rt.tunnel.isReady())
             try pollfds.append(rt.alloc, .{ .fd = lf, .events = POLLIN, .revents = 0 });
         // conns
         for (rt.conns.items) |conn| {

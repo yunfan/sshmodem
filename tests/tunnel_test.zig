@@ -299,3 +299,115 @@ test "mid-stream garbage injection triggers resync, data still delivered" {
     try sc.dataFor(id, &got);
     try std.testing.expect(std.mem.indexOf(u8, got.items, "BBBBBBBB") != null);
 }
+
+// ===================== 探针自动降档（M3） =====================
+
+const Encoding = smodem.tunnel.Encoding;
+
+const Mangler = *const fn ([]const u8, *std.ArrayList(u8)) anyerror!void;
+
+fn mIdentity(in: []const u8, out: *std.ArrayList(u8)) !void {
+    try out.appendSlice(alloc, in);
+}
+fn mOnlcr(in: []const u8, out: *std.ArrayList(u8)) !void { // 0x0A -> 0x0D 0x0A（插字节）
+    for (in) |b| {
+        if (b == 0x0A) try out.append(alloc, 0x0D);
+        try out.append(alloc, b);
+    }
+}
+fn mIstrip(in: []const u8, out: *std.ArrayList(u8)) !void { // 剥高位
+    for (in) |b| try out.append(alloc, b & 0x7F);
+}
+fn mIsig(in: []const u8, out: *std.ArrayList(u8)) !void { // 吞 ^C ^Z ^\
+    for (in) |b| {
+        if (b == 0x03 or b == 0x1A or b == 0x1C) continue;
+        try out.append(alloc, b);
+    }
+}
+
+fn manglePump(a: *Tunnel, b: *Tunnel, ab: Mangler, ba: Mangler) !void {
+    var buf: [8192]u8 = undefined;
+    var tmp: std.ArrayList(u8) = .empty;
+    defer tmp.deinit(alloc);
+    var progress = true;
+    var guard: usize = 0;
+    while (progress and guard < 10000) : (guard += 1) {
+        progress = false;
+        const na = a.send(&buf);
+        if (na > 0) {
+            tmp.clearRetainingCapacity();
+            try ab(buf[0..na], &tmp);
+            try b.recv(tmp.items);
+            progress = true;
+        }
+        const nb = b.send(&buf);
+        if (nb > 0) {
+            tmp.clearRetainingCapacity();
+            try ba(buf[0..nb], &tmp);
+            try a.recv(tmp.items);
+            progress = true;
+        }
+    }
+}
+
+fn drainAll(t: *Tunnel) void {
+    while (t.nextEvent()) |_| {}
+}
+
+/// 建立一对 auto_probe 隧道，用给定 mangler 跑到 ready，再校验一次数据往返。
+fn probeAndVerify(ab: Mangler, ba: Mangler, want_client_tx: Encoding, want_server_tx: Encoding) !void {
+    const cfg = smodem.tunnel.Config{ .auto_probe = true };
+    var client = try Tunnel.init(alloc, cfg, .client);
+    defer client.deinit();
+    var server = try Tunnel.init(alloc, cfg, .server);
+    defer server.deinit();
+
+    try manglePump(&client, &server, ab, ba);
+    try std.testing.expect(client.isReady());
+    try std.testing.expect(server.isReady());
+    // client 的 tx 方向 = client→server = ab；server 的 tx = server→client = ba。
+    try std.testing.expectEqual(want_client_tx, client.txEncoding());
+    try std.testing.expectEqual(want_server_tx, server.txEncoding());
+    // 两端的 rx 应等于对端的 tx。
+    try std.testing.expectEqual(want_server_tx, client.rxEncoding());
+    try std.testing.expectEqual(want_client_tx, server.rxEncoding());
+    drainAll(&client);
+    drainAll(&server);
+
+    // 真实数据必须在协商出的编码下穿过 mangler 完好送达。
+    const id = try client.open("meta");
+    try manglePump(&client, &server, ab, ba);
+    while (server.nextEvent()) |ev| if (ev == .stream_open) try server.accept(ev.stream_open.id, "");
+    try manglePump(&client, &server, ab, ba);
+    drainAll(&client);
+    const payload = "the quick brown fox 0123456789 \n\r\x03\x1a\xff\x00 done";
+    _ = try client.write(id, payload);
+    try manglePump(&client, &server, ab, ba);
+    var sc = Collected{};
+    defer sc.deinit();
+    try sc.drain(&server);
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(alloc);
+    try sc.dataFor(id, &got);
+    try std.testing.expectEqualSlices(u8, payload, got.items);
+}
+
+test "probe: clean pipe picks RAW both directions" {
+    try probeAndVerify(mIdentity, mIdentity, .raw, .raw);
+}
+
+test "probe: ONLCR on client->server downgrades that direction to ESC" {
+    try probeAndVerify(mOnlcr, mIdentity, .esc, .raw);
+}
+
+test "probe: ISTRIP on client->server downgrades to B64, other stays RAW" {
+    try probeAndVerify(mIstrip, mIdentity, .b64, .raw);
+}
+
+test "probe: ISIG (byte-eating) downgrades to ESC" {
+    try probeAndVerify(mIsig, mIdentity, .esc, .raw);
+}
+
+test "probe: both directions hostile (istrip) both pick B64" {
+    try probeAndVerify(mIstrip, mIstrip, .b64, .b64);
+}

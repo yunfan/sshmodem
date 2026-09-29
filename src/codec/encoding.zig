@@ -66,10 +66,9 @@ fn baseEncode(out: []u8, data: []const u8, alpha: []const u8, bpc: u5, group: us
         out[oi] = alpha[(acc << (bpc - nbits)) & mask];
         oi += 1;
     }
-    while (oi % group != 0) {
-        out[oi] = '=';
-        oi += 1;
-    }
+    // 不加 '=' 填充：帧由长度定界（frame.parse），填充多余；且省几字节。
+    // 解码端产出 floor(bits/8) 字节，恰为原长，往返精确。
+    _ = group;
     return oi;
 }
 

@@ -27,7 +27,11 @@ pub const Encoding = encoding.Encoding;
 pub const LogLevel = enum { debug, info, warn, err };
 
 pub const Config = struct {
-    /// 运行编码。M2 全程用它（含握手）；默认 B64，任何链路都能过。
+    /// 自动降档探针（协议 §4.2）。开启后：握手走 B64，握手完成对每个方向
+    /// 逐级探测 RAW→ESC→B64，各自选出最省的能过的编码；`encoding` 字段被忽略。
+    /// 关闭（默认）：全程用固定 `encoding`。CLI 未指定 --encoding 时会打开它。
+    auto_probe: bool = false,
+    /// 固定运行编码（auto_probe=false 时全程用它，含握手）；默认 B64。
     encoding: Encoding = .b64,
     sentinel: u8 = derive.default_sentinel,
     token: []const u8 = derive.default_token,
@@ -100,7 +104,22 @@ const IEvent = union(enum) {
     log: struct { level: LogLevel, msg: Blob },
 };
 
-const Phase = enum { syncing, waiting_hello, ready, closed };
+const Phase = enum { syncing, waiting_hello, probing, ready, closed };
+
+/// 握手期固定用它（协议 §3.4）：一定能过，探针再从此降/升档。
+const handshake_encoding: Encoding = .b64;
+
+/// 透明性探针图案（协议 §4.3）：256 全值 + 16 陷阱字节。含且仅含一个 0x25，
+/// 两侧不同，故不含 SS，捕获边界成立。
+const probe_pattern: [272]u8 = blk: {
+    @setEvalBranchQuota(2000);
+    var p: [272]u8 = undefined;
+    var i: usize = 0;
+    while (i < 256) : (i += 1) p[i] = @intCast(i);
+    const trap = [16]u8{ 0x0D, 0x0A, 0x0A, 0x0D, 0x0D, 0x0D, 0x0A, 0x0A, 0x1A, 0x04, 0x03, 0x1C, 0x11, 0x13, 0x7F, 0xFF };
+    @memcpy(p[256..272], &trap);
+    break :blk p;
+};
 
 pub const Tunnel = struct {
     alloc: Allocator,
@@ -138,6 +157,19 @@ pub const Tunnel = struct {
     decoder: encoding.Decoder,
     desync_count: u32 = 0,
 
+    // —— 探针（auto_probe，协议 §4.2）——
+    probe_seq: u8 = 0,
+    probe_cand: Encoding = .raw, // 我方 tx 正在测试的候选
+    tx_decided: bool = false, // 我方 tx 编码已定
+    rx_enc_set: bool = false, // 已收到对端 ENCODING_SET
+    probe_expected: [640]u8 = undefined, // 我方 PROBE 送出的编码后图案（用于比对）
+    probe_expected_len: usize = 0,
+    capturing: bool = false, // 正在捕获对端 PROBE 的裸图案
+    cap_started: bool = false,
+    cap_run: u8 = 0,
+    cap_seq: u8 = 0,
+    capture: std.ArrayList(u8) = .empty,
+
     // —— 事件 ——
     events: std.ArrayList(IEvent) = .empty,
     ev_cursor: usize = 0,
@@ -159,14 +191,17 @@ pub const Tunnel = struct {
         const fb = try alloc.alloc(u8, rx_frame_cap);
         errdefer alloc.free(fb);
 
+        // auto_probe：握手期用 B64，探针后再切；否则全程用固定 encoding。
+        const start_enc: Encoding = if (cfg.auto_probe) handshake_encoding else cfg.encoding;
+
         var t = Tunnel{
             .alloc = alloc,
             .cfg = cfg,
             .role = role,
             .phase = .syncing,
             .sentinel = cfg.sentinel,
-            .tx_enc = cfg.encoding,
-            .rx_enc = cfg.encoding,
+            .tx_enc = start_enc,
+            .rx_enc = start_enc,
             .session_send = 0,
             .session_recv_remaining = cfg.session_window,
             .streams = std.AutoHashMap(u32, *Stream).init(alloc),
@@ -175,7 +210,7 @@ pub const Tunnel = struct {
             .enc_scratch = enc_s,
             .bootstrap = undefined,
             .framebuf = fb,
-            .decoder = encoding.Decoder.init(cfg.encoding, cfg.sentinel),
+            .decoder = encoding.Decoder.init(start_enc, cfg.sentinel),
         };
         const sync_len = hs.Bootstrap.buildSync(&t.sync_buf, cfg.sentinel, cfg.token);
         t.bootstrap = hs.Bootstrap.init(t.sync_buf[0..sync_len]);
@@ -198,6 +233,7 @@ pub const Tunnel = struct {
         self.tx.deinit(self.alloc);
         self.events.deinit(self.alloc);
         self.ev_bytes.deinit(self.alloc);
+        self.capture.deinit(self.alloc);
         self.alloc.free(self.logical_scratch);
         self.alloc.free(self.enc_scratch);
         self.alloc.free(self.framebuf);
@@ -250,6 +286,12 @@ pub const Tunnel = struct {
     // ===================== TX =====================
 
     fn pushFrame(self: *Tunnel, htype: frame.Type, stream_id: u32, payload: []const u8) Error!void {
+        try self.pushFrameEx(htype, stream_id, payload, true);
+    }
+
+    /// flush=false 用于 PROBE：其后紧跟裸图案，不能夹冲刷换行。
+    /// payload 不得与 self.logical_scratch 别名。
+    fn pushFrameEx(self: *Tunnel, htype: frame.Type, stream_id: u32, payload: []const u8, flush: bool) Error!void {
         const total = try frame.encode(self.logical_scratch, .{
             .type = htype,
             .stream_id = stream_id,
@@ -263,7 +305,7 @@ pub const Tunnel = struct {
             try self.tx.append(self.alloc, self.sentinel);
             const n = encoding.encode(self.tx_enc, self.sentinel, self.enc_scratch, logical);
             try self.tx.appendSlice(self.alloc, self.enc_scratch[0..n]);
-            try self.tx.append(self.alloc, encoding.flush_byte);
+            if (flush) try self.tx.append(self.alloc, encoding.flush_byte);
         }
     }
 
@@ -421,6 +463,29 @@ pub const Tunnel = struct {
             return;
         }
 
+        // 捕获模式：收下对端 PROBE 的裸图案，直到 SS（PROBE_END 起始标记）。
+        if (self.capturing) {
+            if (b == self.sentinel) {
+                self.cap_run += 1;
+                if (self.cap_run >= 2) {
+                    self.cap_run = 0;
+                    self.capturing = false;
+                    try self.finishCapture();
+                    self.startEncFrame(); // 这个 SS 开启 PROBE_END 帧
+                }
+                return;
+            }
+            if (self.cap_run == 1) {
+                self.cap_run = 0;
+                self.cap_started = true;
+                try self.captureByte(self.sentinel);
+            }
+            if (!self.cap_started and b == encoding.flush_byte) return; // 跳过图案前的框帧冲刷
+            self.cap_started = true;
+            try self.captureByte(b);
+            return;
+        }
+
         if (self.rx_enc == .raw) {
             if (self.framelen >= self.framebuf.len) return error.Corrupt;
             self.framebuf[self.framelen] = b;
@@ -506,6 +571,10 @@ pub const Tunnel = struct {
         switch (t) {
             .hello => try self.onHello(p.payload, false),
             .hello_ack => try self.onHello(p.payload, true),
+            .probe => try self.onProbe(p.payload),
+            .probe_end => {}, // 边界已由 SS 触发 finishCapture，此帧仅作确认
+            .probe_result => try self.onProbeResult(p.payload),
+            .encoding_set => try self.onEncodingSet(p.payload),
             .ping => try self.pushFrame(.pong, 0, p.payload),
             .pong => {},
             .session_window => {
@@ -545,8 +614,123 @@ pub const Tunnel = struct {
         if (!is_ack and self.role == .server) {
             try self.sendHello(.hello_ack);
         }
-        self.phase = .ready;
-        try self.push(.ready);
+        if (self.cfg.auto_probe) {
+            self.phase = .probing;
+            try self.startTxProbe(.raw); // 从最省的 RAW 开始逐级降档
+        } else {
+            self.phase = .ready;
+            try self.push(.ready);
+        }
+    }
+
+    // ===================== 探针（协议 §4.2）=====================
+
+    /// 测试"我方 tx 用 cand 编码能否原样到达对端"：发 PROBE + 裸图案 + PROBE_END。
+    fn startTxProbe(self: *Tunnel, cand: Encoding) Error!void {
+        self.probe_cand = cand;
+        self.probe_seq +%= 1;
+        // 图案按 cand 编码后就是要放到线上的裸字节，同时留作比对基准。
+        const n = encoding.encode(cand, self.sentinel, &self.probe_expected, &probe_pattern);
+        self.probe_expected_len = n;
+        var hdr: [4]u8 = undefined;
+        hdr[0] = self.probe_seq;
+        hdr[1] = @intFromEnum(cand);
+        std.mem.writeInt(u16, hdr[2..4], @intCast(n), .little);
+        // PROBE 帧不带冲刷换行——紧跟其后的裸图案不能被 \n 干扰（接收方也会跳过前导 \n）。
+        try self.pushFrameEx(.probe, 0, &hdr, false);
+        try self.tx.appendSlice(self.alloc, self.probe_expected[0..n]);
+        try self.pushFrameEx(.probe_end, 0, &[_]u8{self.probe_seq}, true);
+    }
+
+    /// 我方 tx 编码定档：通告对端并切换。
+    fn txChosen(self: *Tunnel, enc: Encoding) Error!void {
+        // 切到 RAW 时不能带冲刷 \n：RAW 是裸帧，\n 会被当帧字节而错位。
+        try self.pushFrameEx(.encoding_set, 0, &[_]u8{@intFromEnum(enc)}, enc != .raw);
+        self.tx_enc = enc; // 此帧之后本方向改用 enc
+        self.tx_decided = true;
+        try self.maybeReady();
+    }
+
+    fn maybeReady(self: *Tunnel) Error!void {
+        if (self.phase == .probing and self.tx_decided and self.rx_enc_set) {
+            self.phase = .ready;
+            try self.push(.ready);
+        }
+    }
+
+    // 收到对端 PROBE：进入捕获模式，把随后的裸图案原样收下，遇 SS（PROBE_END）为止。
+    fn onProbe(self: *Tunnel, payload: []const u8) Error!void {
+        if (payload.len < 1) return error.ProtocolError;
+        self.cap_seq = payload[0];
+        self.capturing = true;
+        self.cap_started = false;
+        self.cap_run = 0;
+        self.capture.clearRetainingCapacity();
+    }
+
+    fn captureByte(self: *Tunnel, b: u8) Error!void {
+        if (self.capture.items.len < 4096) try self.capture.append(self.alloc, b);
+    }
+
+    // 捕获结束：把收到的裸字节原样回传给对端比对。
+    fn finishCapture(self: *Tunnel) Error!void {
+        var buf: [3 + 4096]u8 = undefined; // capture 上限 4096
+        const clen = @min(self.capture.items.len, 4096);
+        buf[0] = self.cap_seq;
+        std.mem.writeInt(u16, buf[1..3], @intCast(clen), .little);
+        @memcpy(buf[3 .. 3 + clen], self.capture.items[0..clen]);
+        try self.pushFrame(.probe_result, 0, buf[0 .. 3 + clen]);
+    }
+
+    // 收到 PROBE_RESULT：比对我方 tx 是否透明。
+    fn onProbeResult(self: *Tunnel, payload: []const u8) Error!void {
+        if (payload.len < 3) return error.ProtocolError;
+        const seq = payload[0];
+        if (seq != self.probe_seq or self.tx_decided) return; // 过期/已定
+        const rx_len = std.mem.readInt(u16, payload[1..3], .little);
+        const rx = payload[3..];
+        const ok = rx_len == self.probe_expected_len and
+            rx.len >= rx_len and
+            std.mem.eql(u8, rx[0..rx_len], self.probe_expected[0..self.probe_expected_len]);
+        if (ok) {
+            try self.logChosen(self.probe_cand);
+            try self.txChosen(self.probe_cand);
+        } else switch (self.probe_cand) {
+            .raw => try self.startTxProbe(.esc),
+            .esc => {
+                // ESC 也不行：回落 B64（握手已证明它能过，不必再测）。
+                try self.logChosen(.b64);
+                try self.txChosen(.b64);
+            },
+            else => {
+                try self.logChosen(.b64);
+                try self.txChosen(.b64);
+            },
+        }
+    }
+
+    fn logChosen(self: *Tunnel, enc: Encoding) Error!void {
+        const msg = switch (enc) {
+            .raw => "probe: send encoding = RAW",
+            .esc => "probe: send encoding = ESC",
+            .b64 => "probe: send encoding = B64",
+            .b32 => "probe: send encoding = B32",
+        };
+        try self.log(.info, msg);
+    }
+
+    fn onEncodingSet(self: *Tunnel, payload: []const u8) Error!void {
+        if (payload.len < 1) return error.ProtocolError;
+        const enc: Encoding = switch (payload[0]) {
+            0 => .raw,
+            1 => .esc,
+            2 => .b64,
+            3 => .b32,
+            else => return error.ProtocolError,
+        };
+        self.rx_enc = enc; // 下一帧起本方向改用 enc（startEncFrame 会以新 rx_enc 建解码器）
+        self.rx_enc_set = true;
+        try self.maybeReady();
     }
 
     fn onOpen(self: *Tunnel, sid: u32, metadata: []const u8) Error!void {
@@ -635,6 +819,17 @@ pub const Tunnel = struct {
 
     pub fn isReady(self: *Tunnel) bool {
         return self.phase == .ready;
+    }
+
+    /// 探针/协商定下的编码（供内省与测试）。
+    pub fn txEncoding(self: *Tunnel) Encoding {
+        return self.tx_enc;
+    }
+    pub fn rxEncoding(self: *Tunnel) Encoding {
+        return self.rx_enc;
+    }
+    pub fn desyncCount(self: *Tunnel) u32 {
+        return self.desync_count;
     }
 };
 
