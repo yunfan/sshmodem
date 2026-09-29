@@ -51,5 +51,11 @@ rc=$(curl -sS -m 8 -x "socks5h://127.0.0.1:$PORT" "http://127.0.0.1:9/" -o /dev/
 if [ "$rc" = "000" ]; then echo "  ok  refused relayed"; else echo "  note refused code=$rc"; fi
 kill $SM 2>/dev/null; wait $SM 2>/dev/null
 
+echo "== udp associate =="
+"$BIN" -q -p "$PORT" -- "$BIN" serve >"$TMP/sm.log" 2>&1 &
+SM=$!; sleep 1
+if python3 scripts/udp_e2e.py "$PORT" >/tmp/udp.out 2>&1; then echo "  ok  udp associate echo"; else echo "  FAIL udp associate"; cat /tmp/udp.out; FAIL=1; fi
+kill $SM 2>/dev/null; wait $SM 2>/dev/null
+
 if [ "$FAIL" = 0 ]; then echo "E2E: ALL PASS"; else echo "E2E: FAILURES"; fi
 exit $FAIL

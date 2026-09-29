@@ -83,6 +83,7 @@ fn runMain(init: std.process.Init) !u8 {
 
     // 未显式 --encoding 时开启自动降档探针（协议 §4.2），默认体验：干净管道零开销。
     if (!encoding_forced) cfg.tunnel.auto_probe = true;
+    cfg.tunnel.caps = smodem.tunnel.caps.udp_associate;
 
     if (cfg.mode == .serve) {
         try rt.run(alloc, cfg);

@@ -22,6 +22,7 @@ const derive = @import("../codec/derive.zig");
 const hs = @import("handshake.zig");
 
 pub const Role = hs.Role;
+pub const caps = hs.caps;
 pub const Encoding = encoding.Encoding;
 
 pub const LogLevel = enum { debug, info, warn, err };
@@ -55,6 +56,11 @@ pub const Event = union(enum) {
     stream_writable: u32,
     stream_eof: u32,
     stream_reset: struct { id: u32, reason: u8 },
+    // —— UDP 关联（协议 §9）。载荷不透明（socks5 层解释为 地址块+数据）——
+    datagram_open: struct { id: u32, metadata: []const u8 },
+    datagram_accept: struct { id: u32, metadata: []const u8 },
+    datagram_reject: struct { id: u32, code: u8 },
+    datagram: struct { id: u32, payload: []const u8 },
     log: struct { level: LogLevel, msg: []const u8 },
 };
 
@@ -79,8 +85,11 @@ const StreamState = enum {
     closed,
 };
 
+const StreamKind = enum { tcp, udp };
+
 const Stream = struct {
     id: u32,
+    kind: StreamKind = .tcp,
     state: StreamState,
     // 发送：对端授予我方的窗口余额（初始 = 对端 HELLO.stream_window）
     send_window: u32,
@@ -101,6 +110,10 @@ const IEvent = union(enum) {
     stream_writable: u32,
     stream_eof: u32,
     stream_reset: struct { id: u32, reason: u8 },
+    datagram_open: struct { id: u32, meta: Blob },
+    datagram_accept: struct { id: u32, meta: Blob },
+    datagram_reject: struct { id: u32, code: u8 },
+    datagram: struct { id: u32, data: Blob },
     log: struct { level: LogLevel, msg: Blob },
 };
 
@@ -279,6 +292,10 @@ pub const Tunnel = struct {
             .stream_writable => |id| .{ .stream_writable = id },
             .stream_eof => |id| .{ .stream_eof = id },
             .stream_reset => |x| .{ .stream_reset = .{ .id = x.id, .reason = x.reason } },
+            .datagram_open => |x| .{ .datagram_open = .{ .id = x.id, .metadata = self.blobSlice(x.meta) } },
+            .datagram_accept => |x| .{ .datagram_accept = .{ .id = x.id, .metadata = self.blobSlice(x.meta) } },
+            .datagram_reject => |x| .{ .datagram_reject = .{ .id = x.id, .code = x.code } },
+            .datagram => |x| .{ .datagram = .{ .id = x.id, .payload = self.blobSlice(x.data) } },
             .log => |x| .{ .log = .{ .level = x.level, .msg = self.blobSlice(x.msg) } },
         };
     }
@@ -432,6 +449,51 @@ pub const Tunnel = struct {
 
     fn dropStream(self: *Tunnel, id: u32) void {
         if (self.streams.fetchRemove(id)) |kv| self.alloc.destroy(kv.value);
+    }
+
+    // ===================== UDP 关联（协议 §9）=====================
+    // 数据报不走窗口流控（不可靠语义）：sendDatagram 直接入 tx，tx 满则丢弃。
+    // metadata / payload 对隧道不透明（socks5 层解释为地址块 / 地址块+数据）。
+
+    pub fn openDatagram(self: *Tunnel, metadata: []const u8) Error!u32 {
+        if (self.phase != .ready) return error.NotReady;
+        if (self.streams.count() >= self.cfg.max_streams) return error.TooManyStreams;
+        const id = self.next_id;
+        self.next_id += 2;
+        const s = try self.alloc.create(Stream);
+        errdefer self.alloc.destroy(s);
+        s.* = .{ .id = id, .kind = .udp, .state = .opening_local, .send_window = 0, .recv_remaining = 0 };
+        try self.streams.put(id, s);
+        try self.pushFrame(.udp_open, id, metadata);
+        return id;
+    }
+
+    pub fn acceptDatagram(self: *Tunnel, id: u32, metadata: []const u8) Error!void {
+        const s = try self.getStream(id);
+        if (s.kind != .udp or s.state != .open_pending) return error.BadStreamState;
+        s.state = .open;
+        try self.pushFrame(.udp_open_ok, id, metadata);
+    }
+
+    pub fn rejectDatagram(self: *Tunnel, id: u32, code: u8) Error!void {
+        const s = try self.getStream(id);
+        if (s.kind != .udp or s.state != .open_pending) return error.BadStreamState;
+        try self.pushFrame(.udp_open_err, id, &[_]u8{code});
+        self.dropStream(id);
+    }
+
+    /// 发一个数据报。tx 过载则丢弃（返回 false），符合 UDP 可丢语义（协议 §9.3）。
+    pub fn sendDatagram(self: *Tunnel, id: u32, payload: []const u8) Error!bool {
+        const s = self.streams.get(id) orelse return error.NoSuchStream;
+        if (s.kind != .udp or s.state != .open) return error.BadStreamState;
+        if (payload.len > frame.max_payload) return false;
+        if (self.pendingTx() >= self.cfg.session_window) return false; // 丢弃最新
+        try self.pushFrame(.udp_data, id, payload);
+        return true;
+    }
+
+    pub fn closeDatagram(self: *Tunnel, id: u32) void {
+        self.dropStream(id);
     }
 
     // ===================== RX =====================
@@ -598,7 +660,11 @@ pub const Tunnel = struct {
             },
             .close => try self.onClose(sid),
             .reset => try self.onReset(sid, if (p.payload.len > 0) p.payload[0] else 0),
-            else => {}, // 未知/暂不支持（探针、UDP 后续里程碑）：忽略
+            .udp_open => try self.onUdpOpen(sid, p.payload),
+            .udp_open_ok => try self.onUdpOpenOk(sid, p.payload),
+            .udp_open_err => try self.onUdpOpenErr(sid, p.payload),
+            .udp_data => try self.onUdpData(sid, p.payload),
+            else => {}, // 未知：忽略（协议 §5.2）
         }
     }
 
@@ -794,6 +860,39 @@ pub const Tunnel = struct {
         if (self.streams.get(sid) == null) return;
         try self.push(.{ .stream_reset = .{ .id = sid, .reason = reason } });
         self.dropStream(sid);
+    }
+
+    fn onUdpOpen(self: *Tunnel, sid: u32, metadata: []const u8) Error!void {
+        if (self.streams.get(sid) != null) return error.ProtocolError;
+        const s = try self.alloc.create(Stream);
+        errdefer self.alloc.destroy(s);
+        s.* = .{ .id = sid, .kind = .udp, .state = .open_pending, .send_window = 0, .recv_remaining = 0 };
+        try self.streams.put(sid, s);
+        const b = try self.pushBlob(metadata);
+        try self.push(.{ .datagram_open = .{ .id = sid, .meta = b } });
+    }
+
+    fn onUdpOpenOk(self: *Tunnel, sid: u32, metadata: []const u8) Error!void {
+        const s = self.streams.get(sid) orelse return error.ProtocolError;
+        if (s.kind != .udp or s.state != .opening_local) return error.ProtocolError;
+        s.state = .open;
+        const b = try self.pushBlob(metadata);
+        try self.push(.{ .datagram_accept = .{ .id = sid, .meta = b } });
+    }
+
+    fn onUdpOpenErr(self: *Tunnel, sid: u32, payload: []const u8) Error!void {
+        const s = self.streams.get(sid) orelse return error.ProtocolError;
+        if (s.kind != .udp or s.state != .opening_local) return error.ProtocolError;
+        const code: u8 = if (payload.len > 0) payload[0] else 1;
+        try self.push(.{ .datagram_reject = .{ .id = sid, .code = code } });
+        self.dropStream(sid);
+    }
+
+    fn onUdpData(self: *Tunnel, sid: u32, payload: []const u8) Error!void {
+        const s = self.streams.get(sid) orelse return; // 关联已关，丢弃
+        if (s.kind != .udp or s.state != .open) return;
+        const b = try self.pushBlob(payload);
+        try self.push(.{ .datagram = .{ .id = sid, .data = b } });
     }
 
     // ===================== 计时 =====================

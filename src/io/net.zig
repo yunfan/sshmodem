@@ -127,3 +127,49 @@ pub fn close(fd: fd_t) void {
 pub fn shutdownWrite(fd: fd_t) void {
     _ = c.shutdown(fd, posix.SHUT.WR);
 }
+
+// ===================== UDP（协议 §9）=====================
+
+pub const SockAddr4 = posix.sockaddr.in;
+
+pub fn udpSocket() IoError!fd_t {
+    const s = c.socket(posix.AF.INET, posix.SOCK.DGRAM, 0);
+    if (s < 0) return error.SocketFailed;
+    setNonBlock(s);
+    return s;
+}
+
+/// 绑定 UDP socket 到 ip4:port（port=0 让内核选）。
+pub fn udpBind(fd: fd_t, ip4: [4]u8, port: u16) IoError!void {
+    var addr = std.mem.zeroes(SockAddr4);
+    addr.family = posix.AF.INET;
+    addr.port = std.mem.nativeToBig(u16, port);
+    addr.addr = @bitCast(ip4);
+    if (c.bind(fd, @ptrCast(&addr), @sizeOf(SockAddr4)) != 0) return error.BindFailed;
+}
+
+/// 取本地绑定端口（主机序）。
+pub fn localPort(fd: fd_t) u16 {
+    var addr = std.mem.zeroes(SockAddr4);
+    var len: posix.socklen_t = @sizeOf(SockAddr4);
+    _ = c.getsockname(fd, @ptrCast(&addr), &len);
+    return std.mem.bigToNative(u16, addr.port);
+}
+
+pub const RecvFrom = struct { n: usize, ip4: [4]u8, port: u16 };
+
+pub fn recvFrom4(fd: fd_t, buf: []u8) ?RecvFrom {
+    var addr = std.mem.zeroes(SockAddr4);
+    var len: posix.socklen_t = @sizeOf(SockAddr4);
+    const r = c.recvfrom(fd, buf.ptr, buf.len, 0, @ptrCast(&addr), &len);
+    if (r < 0) return null;
+    return .{ .n = @intCast(r), .ip4 = @bitCast(addr.addr), .port = std.mem.bigToNative(u16, addr.port) };
+}
+
+pub fn sendTo4(fd: fd_t, buf: []const u8, ip4: [4]u8, port: u16) void {
+    var addr = std.mem.zeroes(SockAddr4);
+    addr.family = posix.AF.INET;
+    addr.port = std.mem.nativeToBig(u16, port);
+    addr.addr = @bitCast(ip4);
+    _ = c.sendto(fd, buf.ptr, buf.len, 0, @ptrCast(&addr), @sizeOf(SockAddr4));
+}

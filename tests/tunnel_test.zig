@@ -87,6 +87,7 @@ const Collected = struct {
             .stream_writable => |id| try self.writable.append(alloc, id),
             .stream_eof => |id| try self.eofs.append(alloc, id),
             .stream_reset => |x| try self.resets.append(alloc, x.id),
+            .datagram_open, .datagram_accept, .datagram_reject, .datagram => {},
             .log => {},
             .closed => {},
         };
@@ -410,4 +411,95 @@ test "probe: ISIG (byte-eating) downgrades to ESC" {
 
 test "probe: both directions hostile (istrip) both pick B64" {
     try probeAndVerify(mIstrip, mIstrip, .b64, .b64);
+}
+
+// ===================== UDP 关联（M8） =====================
+
+test "udp associate: open, accept, bidirectional datagrams" {
+    const cfg = smodem.tunnel.Config{};
+    var client = try Tunnel.init(alloc, cfg, .client);
+    defer client.deinit();
+    var server = try Tunnel.init(alloc, cfg, .server);
+    defer server.deinit();
+    try pump(&client, &server);
+    drainAll(&client);
+    drainAll(&server);
+
+    // client 开 UDP 关联（元数据 = 请求绑定地址，不透明）。
+    const id = try client.openDatagram("\x01\x00\x00\x00\x00\x00\x00");
+    try pump(&client, &server);
+
+    // server 收到 datagram_open → accept。
+    var got_open = false;
+    while (server.nextEvent()) |ev| switch (ev) {
+        .datagram_open => |x| {
+            got_open = true;
+            try std.testing.expectEqual(id, x.id);
+            try server.acceptDatagram(x.id, "\x01\x00\x00\x00\x00\x00\x00");
+        },
+        else => {},
+    };
+    try std.testing.expect(got_open);
+    try pump(&client, &server);
+
+    var got_accept = false;
+    while (client.nextEvent()) |ev| if (ev == .datagram_accept) {
+        got_accept = true;
+    };
+    try std.testing.expect(got_accept);
+
+    // client → server 数据报（载荷 = 目标地址块 + 数据，隧道不解释）。
+    const dg1 = "\x01\x08\x08\x08\x08\x00\x35hello-dns-query";
+    try std.testing.expect(try client.sendDatagram(id, dg1));
+    try pump(&client, &server);
+    var got_dg = false;
+    while (server.nextEvent()) |ev| if (ev == .datagram) {
+        got_dg = true;
+        try std.testing.expectEqualSlices(u8, dg1, ev.datagram.payload);
+    };
+    try std.testing.expect(got_dg);
+
+    // server → client 数据报（源地址块 + 数据）。
+    const dg2 = "\x01\x08\x08\x08\x08\x00\x35response-payload";
+    try std.testing.expect(try server.sendDatagram(id, dg2));
+    try pump(&client, &server);
+    var got_back = false;
+    while (client.nextEvent()) |ev| if (ev == .datagram) {
+        got_back = true;
+        try std.testing.expectEqualSlices(u8, dg2, ev.datagram.payload);
+    };
+    try std.testing.expect(got_back);
+
+    // client 结束关联 → server 收到 reset → 关联清除。
+    try client.reset(id, 0);
+    try pump(&client, &server);
+    var got_reset = false;
+    while (server.nextEvent()) |ev| if (ev == .stream_reset) {
+        got_reset = true;
+    };
+    try std.testing.expect(got_reset);
+}
+
+test "udp associate: rejection propagates" {
+    const cfg = smodem.tunnel.Config{};
+    var client = try Tunnel.init(alloc, cfg, .client);
+    defer client.deinit();
+    var server = try Tunnel.init(alloc, cfg, .server);
+    defer server.deinit();
+    try pump(&client, &server);
+    drainAll(&client);
+    drainAll(&server);
+
+    _ = try client.openDatagram("meta");
+    try pump(&client, &server);
+    while (server.nextEvent()) |ev| if (ev == .datagram_open) {
+        try server.rejectDatagram(ev.datagram_open.id, 0x01);
+    };
+    try pump(&client, &server);
+    var got_reject = false;
+    while (client.nextEvent()) |ev| if (ev == .datagram_reject) {
+        got_reject = true;
+        try std.testing.expectEqual(@as(u8, 0x01), ev.datagram_reject.code);
+    };
+    try std.testing.expect(got_reject);
 }

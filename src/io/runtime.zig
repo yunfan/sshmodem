@@ -38,7 +38,18 @@ pub const Config = struct {
 
 pub const RunError = error{ SetupFailed, TransportFailed } || net.IoError || Allocator.Error || smodem.tunnel.Error;
 
-const ConnPhase = enum { greeting, request, awaiting, connecting, piping, closing };
+const ConnPhase = enum { greeting, request, awaiting, connecting, piping, closing, udp_control };
+
+/// 一个 UDP 关联（协议 §9）。local：relay socket + curl 的 UDP 源；
+/// serve：连目标的 UDP socket。生命周期绑到 TCP 控制流（local 由 ctrl 关闭触发）。
+const UdpAssoc = struct {
+    stream_id: u32,
+    fd: net.fd_t,
+    ctrl: ?*Conn = null, // local：TCP 控制连接
+    peer_set: bool = false, // local：是否已学到 curl 的 UDP 源
+    peer_ip: [4]u8 = .{ 0, 0, 0, 0 },
+    peer_port: u16 = 0,
+};
 
 const Conn = struct {
     fd: net.fd_t,
@@ -68,6 +79,8 @@ const Runtime = struct {
     wire_obuf: std.ArrayList(u8) = .empty, // tunnel.send 出来但还没写进 wire 的字节
     conns: std.ArrayList(*Conn) = .empty,
     by_stream: std.AutoHashMap(u32, *Conn),
+    udp: std.ArrayList(*UdpAssoc) = .empty,
+    udp_by_stream: std.AutoHashMap(u32, *UdpAssoc),
     io_buf: [65536]u8 = undefined,
     running: bool = true,
 
@@ -152,6 +165,10 @@ fn handleTunnelEvents(rt: *Runtime) !void {
         .stream_writable => {}, // 背压恢复：下一轮 poll 会重新尝试读 socket
         .stream_eof => |id| try onStreamEof(rt, id),
         .stream_reset => |x| onStreamReset(rt, x.id),
+        .datagram_open => |x| try onDatagramOpen(rt, x.id, x.metadata), // serve 侧：对端要开 UDP 关联
+        .datagram_accept => |x| try onDatagramAccept(rt, x.id, x.metadata), // local 侧：远端已绑 UDP
+        .datagram_reject => |x| onDatagramReject(rt, x.id, x.code),
+        .datagram => |x| try onDatagram(rt, x.id, x.payload),
         .closed => rt.running = false,
     };
 }
@@ -237,8 +254,131 @@ fn onStreamEof(rt: *Runtime, id: u32) !void {
 }
 
 fn onStreamReset(rt: *Runtime, id: u32) void {
+    if (rt.udp_by_stream.get(id)) |ua| {
+        closeUdp(rt, ua); // 对端结束了 UDP 关联
+        return;
+    }
     const conn = connByStream(rt, id) orelse return;
     conn.dead = true;
+}
+
+// —— UDP 关联（协议 §9）——
+// serve 侧：对端要开 UDP 关联 → 建目标 UDP socket，接受。
+fn onDatagramOpen(rt: *Runtime, id: u32, metadata: []const u8) !void {
+    _ = metadata;
+    const fd = net.udpSocket() catch {
+        try rt.tunnel.rejectDatagram(id, @intFromEnum(socks5.Rep.general));
+        return;
+    };
+    const ua = try rt.alloc.create(UdpAssoc);
+    ua.* = .{ .stream_id = id, .fd = fd };
+    try rt.udp.append(rt.alloc, ua);
+    try rt.udp_by_stream.put(id, ua);
+    try rt.tunnel.acceptDatagram(id, "\x01\x00\x00\x00\x00\x00\x00");
+}
+
+// local 侧：远端已绑 UDP（关联建立确认）。本地无需动作（relay 已就绪）。
+fn onDatagramAccept(rt: *Runtime, id: u32, metadata: []const u8) !void {
+    _ = rt;
+    _ = id;
+    _ = metadata;
+}
+
+fn onDatagramReject(rt: *Runtime, id: u32, code: u8) void {
+    _ = code;
+    if (rt.udp_by_stream.get(id)) |ua| closeUdp(rt, ua);
+}
+
+// 收到一个数据报。payload = 地址块 + 数据（socks5 层语义，协议 §9.2）。
+fn onDatagram(rt: *Runtime, id: u32, payload: []const u8) !void {
+    const ua = rt.udp_by_stream.get(id) orelse return;
+    if (rt.cfg.mode == .serve) {
+        try serveSendDatagram(rt, ua, payload);
+    } else {
+        localReturnDatagram(rt, ua, payload);
+    }
+}
+
+fn closeUdp(rt: *Runtime, ua: *UdpAssoc) void {
+    _ = rt.udp_by_stream.remove(ua.stream_id);
+    net.close(ua.fd);
+    for (rt.udp.items, 0..) |p, i| {
+        if (p == ua) {
+            _ = rt.udp.swapRemove(i);
+            break;
+        }
+    }
+    rt.alloc.destroy(ua);
+}
+
+fn findUdpByFd(rt: *Runtime, fd: net.fd_t) ?*UdpAssoc {
+    for (rt.udp.items) |ua| if (ua.fd == fd) return ua;
+    return null;
+}
+
+// serve 侧：payload = 目标地址块 + 数据 → 解析地址 → sendto 目标。
+fn serveSendDatagram(rt: *Runtime, ua: *UdpAssoc, payload: []const u8) !void {
+    const dec = address.decode(payload) catch return;
+    const data = payload[dec.consumed..];
+    var ip4: [4]u8 = undefined;
+    switch (dec.addr.host) {
+        .ipv4 => |a| ip4 = a,
+        .domain => |d| {
+            var hb: [256]u8 = undefined;
+            if (d.len >= hb.len) return;
+            @memcpy(hb[0..d.len], d);
+            hb[d.len] = 0;
+            ip4 = net.resolve4(hb[0..d.len :0], dec.addr.port) catch return;
+        },
+        .ipv6 => return,
+    }
+    net.sendTo4(ua.fd, data, ip4, dec.addr.port);
+    _ = rt;
+}
+
+// local 侧：payload = 源地址块 + 数据 → 加 SOCKS5 UDP 头 → 发回 curl。
+fn localReturnDatagram(rt: *Runtime, ua: *UdpAssoc, payload: []const u8) void {
+    if (!ua.peer_set) return; // 还没学到 curl 的 UDP 源
+    var buf: [70000]u8 = undefined;
+    if (payload.len + 3 > buf.len) return;
+    buf[0] = 0;
+    buf[1] = 0;
+    buf[2] = 0; // RSV RSV FRAG
+    @memcpy(buf[3 .. 3 + payload.len], payload);
+    net.sendTo4(ua.fd, buf[0 .. 3 + payload.len], ua.peer_ip, ua.peer_port);
+    _ = rt;
+}
+
+// local 侧：relay socket 可读 → 收 curl 的 UDP → 剥 SOCKS5 头 → sendDatagram。
+fn localRelayReadable(rt: *Runtime, ua: *UdpAssoc) !void {
+    var buf: [70000]u8 = undefined;
+    while (net.recvFrom4(ua.fd, &buf)) |r| {
+        // 来源校验（协议 §9.4）：只认第一包学到的那个 IP。
+        if (!ua.peer_set) {
+            ua.peer_set = true;
+            ua.peer_ip = r.ip4;
+            ua.peer_port = r.port;
+        } else if (!std.mem.eql(u8, &r.ip4, &ua.peer_ip)) {
+            continue; // 丢弃陌生来源
+        }
+        if (r.n < 3) continue;
+        if (buf[2] != 0) continue; // FRAG != 0 丢弃（协议 §9.2）
+        // buf[3..n] = ATYP+ADDR+PORT+DATA，正是隧道数据报载荷。
+        _ = rt.tunnel.sendDatagram(ua.stream_id, buf[3..r.n]) catch {};
+    }
+}
+
+// serve 侧：目标 UDP socket 可读 → recvfrom → 载荷 = 源地址块 + 数据 → 回送。
+fn serveTargetReadable(rt: *Runtime, ua: *UdpAssoc) !void {
+    var buf: [70000]u8 = undefined;
+    while (net.recvFrom4(ua.fd, &buf)) |r| {
+        const src = address.Address{ .host = .{ .ipv4 = r.ip4 }, .port = r.port };
+        var payload: [70016]u8 = undefined;
+        const alen = src.encode(&payload);
+        if (alen + r.n > payload.len) continue;
+        @memcpy(payload[alen .. alen + r.n], buf[0..r.n]);
+        _ = rt.tunnel.sendDatagram(ua.stream_id, payload[0 .. alen + r.n]) catch {};
+    }
 }
 
 // ===================== SOCKS5 握手（local） =====================
@@ -285,6 +425,10 @@ fn driveSocks5Request(rt: *Runtime, conn: *Conn) !void {
     switch (r) {
         .need_more => return,
         .ok => |req| {
+            if (req.cmd == .udp_associate) {
+                try startUdpAssociate(rt, conn, req);
+                return;
+            }
             if (req.cmd != .connect) {
                 var rep: [32]u8 = undefined;
                 const n = socks5.buildError(&rep, .cmd_unsupported);
@@ -299,6 +443,37 @@ fn driveSocks5Request(rt: *Runtime, conn: *Conn) !void {
             shiftHs(conn, req.consumed);
         },
     }
+}
+
+// local 侧 UDP ASSOCIATE：绑 relay socket、开数据报关联、立刻回 relay 地址给 curl。
+// TCP 控制连接保持打开；它一断，关联即销毁（协议 §9.1）。
+fn startUdpAssociate(rt: *Runtime, conn: *Conn, req: socks5.Request) !void {
+    const relay = net.udpSocket() catch {
+        var rep: [32]u8 = undefined;
+        const n = socks5.buildError(&rep, .general);
+        try rt.queueToSock(conn, rep[0..n]);
+        conn.phase = .closing;
+        return;
+    };
+    net.udpBind(relay, .{ 127, 0, 0, 1 }, 0) catch {
+        net.close(relay);
+        conn.dead = true;
+        return;
+    };
+    const port = net.localPort(relay);
+    const id = try rt.tunnel.openDatagram(req.addr_block);
+    const ua = try rt.alloc.create(UdpAssoc);
+    ua.* = .{ .stream_id = id, .fd = relay, .ctrl = conn };
+    try rt.udp.append(rt.alloc, ua);
+    try rt.udp_by_stream.put(id, ua);
+    conn.stream_id = id;
+    conn.phase = .udp_control;
+    // 回 curl：SOCKS5 成功 + relay 绑定地址（127.0.0.1:port）。
+    var rep: [32]u8 = undefined;
+    const bind = address.Address{ .host = .{ .ipv4 = .{ 127, 0, 0, 1 } }, .port = port };
+    const n = socks5.buildReply(&rep, .success, bind);
+    try rt.queueToSock(conn, rep[0..n]);
+    shiftHs(conn, req.consumed);
 }
 
 fn shiftHs(conn: *Conn, consumed: usize) void {
@@ -373,9 +548,13 @@ fn eventLoop(rt: *Runtime) !void {
             var ev: i16 = 0;
             if (conn.phase == .greeting or conn.phase == .request) ev |= POLLIN;
             if (conn.phase == .piping and conn.want_read) ev |= POLLIN;
+            if (conn.phase == .udp_control) ev |= POLLIN; // 检测 TCP 控制连接关闭
             if (conn.t2s.items.len > 0 or conn.phase == .connecting) ev |= POLLOUT;
             if (ev != 0) try pollfds.append(rt.alloc, .{ .fd = conn.fd, .events = ev, .revents = 0 });
         }
+        // UDP relay / target socket
+        for (rt.udp.items) |ua|
+            try pollfds.append(rt.alloc, .{ .fd = ua.fd, .events = POLLIN, .revents = 0 });
 
         _ = posix.poll(pollfds.items, 1000) catch 0;
 
@@ -396,9 +575,22 @@ fn eventLoop(rt: *Runtime) !void {
                     conn.* = .{ .fd = cfd, .phase = .greeting };
                     try rt.addConn(conn);
                 }
+            } else if (findUdpByFd(rt, pfd.fd)) |ua| {
+                if ((pfd.revents & POLLIN) != 0) {
+                    if (rt.cfg.mode == .serve) try serveTargetReadable(rt, ua) else try localRelayReadable(rt, ua);
+                }
             } else {
                 // conn fd
                 const conn = findConnByFd(rt, pfd.fd) orelse continue;
+                if (conn.phase == .udp_control) {
+                    // TCP 控制连接：任何可读多半是对端关闭 → 结束 UDP 关联。
+                    var tmp: [256]u8 = undefined;
+                    switch (net.readFd(conn.fd, &tmp)) {
+                        .eof, .err => conn.dead = true,
+                        else => {},
+                    }
+                    continue;
+                }
                 if (conn.phase == .connecting and (pfd.revents & POLLOUT) != 0) {
                     const e = net.connectResult(conn.fd);
                     if (e == posix.E.SUCCESS) {
@@ -435,6 +627,8 @@ fn eventLoop(rt: *Runtime) !void {
             rt.flushSock(conn);
             const flushed = conn.t2s.items.len == 0;
             if (conn.dead and flushed) {
+                // UDP 控制连接关闭：先拆本地 relay，reset 通知远端结束关联。
+                if (rt.udp_by_stream.get(conn.stream_id)) |ua| closeUdp(rt, ua);
                 if (conn.stream_id != 0) rt.tunnel.reset(conn.stream_id, 0) catch {};
                 rt.dropConn(conn);
                 continue;
@@ -502,10 +696,19 @@ fn runLocal(alloc: Allocator, cfg: Config) RunError!void {
         .wire_out = ch.stdin_fd,
         .listen_fd = listen_fd,
         .by_stream = std.AutoHashMap(u32, *Conn).init(alloc),
+        .udp_by_stream = std.AutoHashMap(u32, *UdpAssoc).init(alloc),
     };
     defer rt.tunnel.deinit();
     defer rt.wire_obuf.deinit(alloc);
     defer rt.by_stream.deinit();
+    defer rt.udp_by_stream.deinit();
+    defer {
+        for (rt.udp.items) |ua| {
+            net.close(ua.fd);
+            alloc.destroy(ua);
+        }
+        rt.udp.deinit(alloc);
+    }
     defer {
         for (rt.conns.items) |conn| {
             conn.deinit(alloc);
@@ -527,10 +730,19 @@ fn runServe(alloc: Allocator, cfg: Config) RunError!void {
         .wire_in = 0,
         .wire_out = 1,
         .by_stream = std.AutoHashMap(u32, *Conn).init(alloc),
+        .udp_by_stream = std.AutoHashMap(u32, *UdpAssoc).init(alloc),
     };
     defer rt.tunnel.deinit();
     defer rt.wire_obuf.deinit(alloc);
     defer rt.by_stream.deinit();
+    defer rt.udp_by_stream.deinit();
+    defer {
+        for (rt.udp.items) |ua| {
+            net.close(ua.fd);
+            alloc.destroy(ua);
+        }
+        rt.udp.deinit(alloc);
+    }
     defer {
         for (rt.conns.items) |conn| {
             conn.deinit(alloc);
