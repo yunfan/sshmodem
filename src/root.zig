@@ -14,6 +14,9 @@ pub const Tunnel = sansio.Tunnel;
 pub const Event = sansio.Event;
 pub const Role = sansio.Role;
 
+// 层次三（SOCKS5 语义）：wire 解析 + 应答构造（建在 Tunnel 上）。
+pub const socks5 = sansio.socks5;
+
 // 层次一（SOCKS5 与开箱即用 run/Config）：随 socks5/ 与 io/ 就位补上。
 
 test {

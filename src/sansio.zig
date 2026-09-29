@@ -21,8 +21,8 @@ pub const Tunnel = tunnel.Tunnel;
 pub const Event = tunnel.Event;
 pub const Role = tunnel.Role;
 
-// 第二层：SOCKS5 语义（建在隧道上）。随实现推进补上导出。
-// pub const socks5 = @import("socks5/root.zig");
+// 第二层：SOCKS5 语义（建在隧道上）。
+pub const socks5 = @import("socks5/root.zig");
 
 test {
     _ = codec.crc32;
@@ -32,4 +32,5 @@ test {
     _ = codec.encoding;
     _ = tunnel;
     _ = @import("tunnel/handshake.zig");
+    _ = socks5;
 }
