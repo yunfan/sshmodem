@@ -51,6 +51,13 @@ rc=$(curl -sS -m 8 -x "socks5h://127.0.0.1:$PORT" "http://127.0.0.1:9/" -o /dev/
 if [ "$rc" = "000" ]; then echo "  ok  refused relayed"; else echo "  note refused code=$rc"; fi
 kill $SM 2>/dev/null; wait $SM 2>/dev/null
 
+echo "== armor + key =="
+"$BIN" -q -p "$PORT" --armor --key e2e-secret -- "$BIN" serve >"$TMP/sm.log" 2>&1 &
+SM=$!; sleep 1
+check "armor small" 200 "http://127.0.0.1:$HTTP/big.bin" "$TMP/oa"
+grep -q "send=b32 recv=b32" "$TMP/sm.log" && echo "  ok  armor negotiated B32" || { echo "  FAIL armor not B32"; cat "$TMP/sm.log"; FAIL=1; }
+kill $SM 2>/dev/null; wait $SM 2>/dev/null
+
 echo "== udp associate =="
 "$BIN" -q -p "$PORT" -- "$BIN" serve >"$TMP/sm.log" 2>&1 &
 SM=$!; sleep 1
