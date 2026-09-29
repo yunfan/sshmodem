@@ -75,6 +75,12 @@ pub fn build(b: *std.Build) void {
     // 让 test 依赖这次编译：core/ 一旦混进 syscall，这里就编译失败。
     test_step.dependOn(&core_check.step);
 
+    // ---- e2e：脚本化端到端冒烟（需先 build 出 binary）----
+    const e2e_step = b.step("e2e", "Run end-to-end smoke test (curl over socks5h)");
+    const e2e_run = b.addSystemCommand(&.{ "bash", "scripts/e2e.sh" });
+    e2e_run.addArtifactArg(exe);
+    e2e_step.dependOn(&e2e_run.step);
+
     // ---- release：多平台静态 baseline 二进制（决策 D12）----
     const release_step = b.step("release", "Cross-compile static baseline binaries");
     const targets = [_]std.Target.Query{
