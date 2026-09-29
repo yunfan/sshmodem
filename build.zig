@@ -44,6 +44,7 @@ pub fn build(b: *std.Build) void {
     // 外置测试文件（tests/*.zig），各自 import 库模块。
     const extra_tests = [_][]const u8{
         "tests/encoding_test.zig",
+        "tests/tunnel_test.zig",
     };
     for (extra_tests) |path| {
         const t = b.addTest(.{

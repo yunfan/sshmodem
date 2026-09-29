@@ -8,8 +8,11 @@ const sansio = @import("sansio.zig");
 // 层次三（协议原语）：线格式编解码。
 pub const codec = sansio.codec;
 
-// 层次二（通用隧道）：Tunnel / Event / Stream —— 应用无关的传输，可单独复用。
-//   pub const Tunnel = sansio.Tunnel;   （随实现补上）
+// 层次二（通用隧道）：Tunnel / Event / Role —— 应用无关的传输，可单独复用。
+pub const tunnel = sansio.tunnel;
+pub const Tunnel = sansio.Tunnel;
+pub const Event = sansio.Event;
+pub const Role = sansio.Role;
 
 // 层次一（SOCKS5 与开箱即用 run/Config）：随 socks5/ 与 io/ 就位补上。
 
