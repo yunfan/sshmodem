@@ -45,19 +45,20 @@ src/
   main.zig                CLI 入口：解析参数，分发到 local / serve
   root.zig                库入口，导出全部模块供测试使用
   protocol/
-    encoding.zig          传输编码层：RAW / ESC / B64 编解码器
-    frame.zig             帧头编解码、类型定义、常量
+    encoding.zig          传输编码层：RAW/ESC/B64 编解码器、冲刷换行、%% 重同步
+    frame.zig             逻辑帧编解码（头+payload+CRC32 帧尾）、类型定义、常量
     address.zig           RFC 1928 地址块编解码
-    handshake.zig         SYNC 扫描、HELLO 协商、逐级降档探针
-    crc32.zig             CRC-32/ISO-HDLC
+    handshake.zig         SYNC 扫描、HELLO 协商、逐级降档探针、冲刷探针
+    crc32.zig             CRC-32/ISO-HDLC（探针与帧尾共用）
   mux/
     session.zig           会话状态机、帧分发、保活
     stream.zig            TCP 流状态机、双层窗口
     udp.zig               UDP 关联：中继 socket、丢弃队列、来源校验
     scheduler.zig         出站 round-robin + 控制帧优先
-    reader.zig            入站字节流 → 解码 → 帧（处理任意分片）
+    reader.zig            入站字节流 → 解码 → 重同步 → 帧（处理任意分片）
   socks5.zig              SOCKS5 服务端解析器（增量式，含 UDP 头）
-  local.zig               本地模式：监听、ssh 子进程、事件循环
+  transport.zig           传输命令驱动：命令 / 交互 / 自定义三档（§12）
+  local.zig               本地模式：监听、拉起 transport、事件循环
   serve.zig               远端模式：stdio、connect、事件循环
   io/
     poller.zig            poll(2) 事件循环封装
@@ -193,9 +194,19 @@ smodem -- ssh -J a@b c@d smodem serve # 完全自定义传输命令
 | `ixon` | 吞掉 `0x11` `0x13` | 同上 |
 | `istrip` | `b & 0x7F` | Round 0、Round 1 都失败，降到 B64 通过 |
 | `ssh_tilde` | 行首 `~~` → `~` | 协议不使用 `~`，必须不受影响 |
-| `hostile` | 同时开启以上全部 | 最终必须落到 B64 且数据完整 |
+| `line_buffered` | 攒着字节，见到 `\n` 才整段放行 | 冲刷探针判定逐行缓冲；启用每帧补 `\n` 后数据不再死锁 |
+| `maxcanon` | 逐行缓冲 + 单行超 4096 字节就截断 | payload 压到 512 后不再丢数据 |
+| `injector` | 稳态每隔 N 字节插入一段 `\r\n[3 min left]\r\n` | CRC 发现被污染帧，`%%` 重同步，至多丢一帧，其余完整 |
+| `bastion` | `onlcr` + `line_buffered` + `injector` 同时开 | 模拟审计堡垒机全套：最终必须落到 ESC/B64、逐行冲刷、能重同步，数据完整 |
+| `hostile` | 以上全部再叠 `istrip` | 只剩可打印 ASCII 也要通：落到 B64 且数据完整 |
 
-最后一行是这套设计的终极断言：**线再烂，只要还能过可打印 ASCII，隧道就得通**。
+`line_buffered` 那行专门锁住 D22 最隐蔽的死锁：**不写这条测试，行缓冲的链路会
+"握手成功、一发数据就永久卡死"，而这在没有专门模拟器时根本复现不出来。**
+
+`injector` 那行锁住 D23：稳态注入必须被 CRC 发现、被 `%%` 重同步吸收，
+损失有界而不是从此全乱。
+
+最后两行是终极断言：**线再烂，只要还能过可打印 ASCII，隧道就得通**。
 这组测试直接锁住本工具最独特的能力不被改坏。
 
 ### 7.3 帧与解析层（`frame_test.zig`、`socks5_test.zig`）

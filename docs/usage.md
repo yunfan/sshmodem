@@ -49,7 +49,36 @@ smodem -- ssh -J bastion@a user@b smodem serve   # 自定义整条传输命令
 最后一条形式下，`--` 之后的一切原样执行，你可以套任意层跳板、
 换成 `kubectl exec`、`docker exec`、串口工具，只要它能跑一个双向字符通道。
 
-## 3. 已经登录在终端里的情况
+## 3. 审计堡垒机（用户名编码路由）
+
+有的堡垒机把目标机信息编进用户名，连上时还刷倒计时、横幅、"会话剩余 N 分钟"。
+这类链路 smodem 专门对付过，用法不变——用户名那串**原样给它**就行：
+
+```bash
+smodem 'alice#prod-web-01@bastion'         # 用户名整串原样传给 ssh，路由是堡垒机的事
+```
+
+smodem 不去解析用户名里的 `#` `:` `+` 之类分隔——各家堡垒机语法不同，
+解析是个无底洞。它只负责把这串交给 ssh，然后：
+
+- 倒计时、横幅、命令回显 → 引导阶段**自动跳过**；
+- 堡垒机把 `\n` 改成 `\r\n`、或吞控制字符 → 传输编码**自动降档**；
+- 堡垒机**逐行审计**（攒着不发、等 `\n` 才转发）→ smodem 会探出来并逐帧补换行，
+  否则这种链路会"连上正常、一传数据就永久卡死"；
+- 会话中途插进来的"剩余 5 分钟"提示 → 帧校验发现后**自动重同步**，至多丢一帧。
+
+这些全自动，启动输出里能看到探测结果（§4）。
+
+如果你的堡垒机**只给交互式 shell、不许 `ssh user@host 命令`**，加 `--interactive`：
+
+```bash
+smodem --interactive 'alice#prod-web-01@bastion'
+```
+
+smodem 会进到 shell 后自动把 `smodem serve` 敲进去。默认不开这个模式，
+因为多数堡垒机（包括你验证过的这台）支持直接带命令，那条路更稳。
+
+## 4. 已经登录在终端里的情况
 
 像当年敲 `rz` 那样：人已经在跳板机的交互式 shell 里，直接敲
 
@@ -60,7 +89,7 @@ smodem serve
 然后在本地另开一端接上去。这条路会走到 pty，`smodem` 会自动把 tty 切成 raw，
 并在退出时恢复。
 
-## 4. 看懂启动输出
+## 5. 看懂启动输出
 
 正常启动大概是这样（全部走 stderr，stdout 只属于协议）：
 
@@ -81,7 +110,23 @@ smodem 0.1.0  local mode
 
 两个方向各自协商，不会互相拖累。
 
-## 5. 出问题时
+审计堡垒机这种最难缠的链路，会看到探测把每一项都点出来：
+
+```
+  transport : ssh -T alice#prod-web-01@bastion smodem serve
+  handshake : sync ok, peer smodem/0.1.0 linux-x86_64
+  probe     : send=B64 recv=ESC          <- 上行连 ESC 都过不去，降到 B64
+  flush     : send=line-buffered         <- 堡垒机逐行审计，已开启逐帧补换行
+  ready     : 1.12s
+```
+
+跑起来后如果堡垒机不停灌"剩余时间"提示，会看到重同步计数，不影响使用：
+
+```
+  resync    : 3 frames recovered (bastion injected noise)  <- 每次至多丢一帧
+```
+
+## 6. 出问题时
 
 ### 握手超时
 
@@ -130,7 +175,7 @@ channel unusable: even Base64 did not survive
 如果本该是干净管道却降到了 B64，多半是 ssh 分配了 pty——
 确认传输命令里有 `-T`。
 
-## 6. 安全须知
+## 7. 安全须知
 
 - **协议自己不加密**，安全性完全来自 SSH。不要在裸 TCP 或裸串口上
   用它传敏感流量。
