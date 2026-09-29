@@ -503,3 +503,42 @@ test "udp associate: rejection propagates" {
     };
     try std.testing.expect(got_reject);
 }
+
+// ===================== 保活 / 空闲超时 =====================
+
+test "keepalive keeps an idle tunnel alive past idle timeout" {
+    const cfg = smodem.tunnel.Config{ .keepalive_ms = 100, .idle_timeout_ms = 300 };
+    var client = try Tunnel.init(alloc, cfg, .client);
+    defer client.deinit();
+    var server = try Tunnel.init(alloc, cfg, .server);
+    defer server.deinit();
+    try pump(&client, &server);
+    try std.testing.expect(client.isReady() and server.isReady());
+    drainAll(&client);
+    drainAll(&server);
+
+    // 空转远超 idle_timeout（300ms），期间只有保活 PING/PONG。不得超时。
+    var t: u64 = 0;
+    while (t <= 1000) : (t += 50) {
+        try client.tick(t); // 无 fix 时此处会在 t>=300 抛 IdleTimeout
+        try server.tick(t);
+        try pump(&client, &server);
+        drainAll(&client);
+        drainAll(&server);
+    }
+    try std.testing.expect(client.isReady() and server.isReady());
+}
+
+test "idle timeout fires when peer truly silent" {
+    const cfg = smodem.tunnel.Config{ .keepalive_ms = 100_000, .idle_timeout_ms = 300 };
+    var client = try Tunnel.init(alloc, cfg, .client);
+    defer client.deinit();
+    var server = try Tunnel.init(alloc, cfg, .server);
+    defer server.deinit();
+    try pump(&client, &server);
+    drainAll(&client);
+    drainAll(&server);
+    // 不 pump（对端完全沉默），keepalive 也关到很大 → 到点必须超时。
+    try client.tick(100);
+    try std.testing.expectError(error.IdleTimeout, client.tick(500));
+}

@@ -192,6 +192,7 @@ pub const Tunnel = struct {
     start_ms: ?u64 = null,
     last_rx_ms: u64 = 0,
     last_ping_ms: u64 = 0,
+    rx_activity: bool = false, // 自上次 tick 以来是否收到过字节（喂空闲计时）
 
     const max_send_payload = frame.max_data_payload; // 16384
     const rx_frame_cap = frame.frameLen(frame.max_payload); // 65535 上限
@@ -499,6 +500,7 @@ pub const Tunnel = struct {
     // ===================== RX =====================
 
     pub fn recv(self: *Tunnel, from_wire: []const u8) Error!void {
+        if (from_wire.len > 0) self.rx_activity = true; // 喂空闲计时（含保活 PONG）
         for (from_wire) |b| try self.rxByte(b);
     }
 
@@ -934,6 +936,10 @@ pub const Tunnel = struct {
         if (self.phase != .ready) {
             if (now_ms - self.start_ms.? >= self.cfg.handshake_timeout_ms) return error.HandshakeTimeout;
             return;
+        }
+        if (self.rx_activity) { // 收到过任何字节 → 重置空闲计时
+            self.last_rx_ms = now_ms;
+            self.rx_activity = false;
         }
         if (now_ms - self.last_rx_ms >= self.cfg.idle_timeout_ms) return error.IdleTimeout;
         if (now_ms - self.last_ping_ms >= self.cfg.keepalive_ms) {
