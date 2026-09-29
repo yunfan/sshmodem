@@ -55,4 +55,26 @@ zig build release  # 多平台静态基线二进制
 可以直接丢到任何一台 Linux 跳板机上跑（自己 `scp` 过去，
 smodem 不会偷偷往跳板机上写东西）。
 
+## 作为库使用
+
+smodem 是**一个可复用库 + 一个薄命令行 binary**。核心是 **sans-io** 的：
+喂它字节和时间，它吐出要发的字节和事件，不碰 socket——所以能塞进任何 I/O 模型，
+也能只取其中一层（只要线协议编解码，或只要多路复用）。
+
+```zig
+// build.zig.zon 里加依赖后：
+const smodem = @import("smodem");
+
+// 开箱即用：起一个完整隧道
+try smodem.run(alloc, .{ .listen_port = 1080, .target = "user@host" });
+
+// 或者只用 sans-io 引擎，自己接 I/O：
+var s = try smodem.Session.init(alloc, .{}, .client);
+try s.pushTunnelBytes(recv_from_ssh);
+while (s.nextEvent()) |ev| switch (ev) { ... }
+```
+
+公开 API 分三层次：`run`/`Config`（开箱即用）、`Session`/`Event`（自带 I/O 模型）、
+`codec`/`socks5`/`wire`（只要协议原语）。详见 [docs/design.md §3.1](docs/design.md)。
+
 状态：设计完成，实现进行中。

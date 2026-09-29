@@ -431,3 +431,36 @@ usage.md 给出 `scp` 与 `cat | ssh` 两条现成命令。
 
 **加固参数不走 HELLO 协商**：本地端把解析后的哨兵/编码/字母表拼进远端命令，
 连接建立前就敲定，比运行时协商更简单、更难出错，也和 D24 的驱动方式一脉相承。
+
+---
+
+## D27 · sans-io 可复用库 + 薄命令行 binary
+**2026-09-29 · 已定**
+
+用户要求实现成"可被别人复用的库 + 使用此库的薄命令行 binary"。落实为三层，
+边界即依赖方向 `cli → io → core`，`core` 谁都不依赖：
+
+- **core/**：sans-io 内核（编解码、握手、mux 会话、SOCKS5 解析）。
+  **零 syscall**——喂它收到的字节和当前时间，它吐出要发的字节和事件（`Event`）。
+  不认识 socket、poll、进程。
+- **io/**：POSIX 运行时（poll 循环、tty、拉起 ssh、`run(config)`）。可选。
+- **cli/**：薄 binary，只解析 argv、调 `run`、映射退出码。
+
+**为什么是 sans-io 而不是把逻辑直接写进事件循环**：sans-io 内核能塞进任何 I/O
+模型（阻塞/poll/epoll/io_uring/异步/wasm），也能被只想要其中一层的人单独取用
+（只要线格式、或只要 mux）。测试还不需要真 fd。这正是"能被别人复用"的技术前提；
+把状态机和 socket 揉在一起，就只能被 smodem 自己用。
+
+**三条纪律**（也是 code review 硬标准）：
+
+1. 调用方给 allocator，库内不藏全局分配器；
+2. 库不 `print`、不 `exit`——诊断作为 `Event.log` 返回，退出码由 cli 翻译 `Error`；
+3. `core/` 零 syscall，由 `freestanding_test.zig` 编译期红线守住，不靠自觉。
+
+**公开 API 分三层次**（`root.zig` re-export，见 design.md §3.1）：
+`run`/`Config`（开箱即用）、`Session`/`Event`（自带 I/O 模型）、
+`codec`/`socks5`/`wire`（只要协议原语）。内部模块不外泄，
+`core/` `io/` `cli/` 可自由重构而不惊动下游。
+
+**放弃**：把逻辑直接铺在事件循环里能少写一层 `Session` 门面。
+但那样就锁死在一种 I/O 模型、且无法被复用，与用户目标直接冲突，不可取。

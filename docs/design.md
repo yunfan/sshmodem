@@ -31,54 +31,97 @@
 
 ## 3. 目录结构
 
-结构即文档，目录名直接对应协议的分层：
+分成**三层，边界即依赖方向**：核心库不依赖 I/O，I/O 运行时不依赖 CLI，
+CLI 只是接线。目录直接画出这条边界（详见 §3.1 库 API 与复用边界）。
 
 ```
-build.zig                 构建脚本，含 release 目标（交叉编译 + baseline）
-build.zig.zon
-docs/
-  protocol.md             线协议规范（规范性）
-  design.md               本文
-  decisions.md            技术决策记录（ADR）
-  usage.md                使用手册
+build.zig                 暴露库模块 "smodem" + 薄可执行 "smodem" + release 目标
+build.zig.zon             .name = .smodem，供他人作依赖引用
+docs/                     protocol.md / design.md / decisions.md / usage.md
+
 src/
-  main.zig                CLI 入口：解析参数，分发到 local / serve
-  root.zig                库入口，导出全部模块供测试使用
-  protocol/
-    encoding.zig          传输编码层：RAW/ESC/B64/B32 编解码器、冲刷换行、SS 重同步
-                          （哨兵字节参数化，默认 %，加固模式派生）
-    frame.zig             逻辑帧编解码（头+payload+CRC32 帧尾）、类型定义、常量
-    address.zig           RFC 1928 地址块编解码
-    handshake.zig         引导序列（token 可派生）、HELLO 协商、降档探针、冲刷探针
-    derive.zig            由 --key 派生 token 与哨兵（SHA256 + BASE32，std.crypto）
-    crc32.zig             CRC-32/ISO-HDLC（探针与帧尾共用）
-  mux/
-    session.zig           会话状态机、帧分发、保活
+  root.zig                ← 库的唯一公开入口。别人 @import("smodem") 拿到的就是它，
+                            只 re-export 稳定 API（§3.1），内部模块不外泄
+
+  core/                   ← 【第一层】sans-io 内核。零 syscall，可 freestanding 编译
+    codec/
+      encoding.zig          RAW/ESC/B64/B32 编解码器、冲刷换行、SS 重同步（哨兵参数化）
+      frame.zig             逻辑帧编解码（头 + payload + CRC32 帧尾）、类型与常量
+      address.zig           RFC 1928 地址块编解码
+      crc32.zig             CRC-32/ISO-HDLC（探针与帧尾共用）
+      derive.zig            由 key 派生 token 与哨兵（SHA256 + BASE32，std.crypto）
+    handshake.zig         引导/HELLO/降档探针/冲刷探针——全部是纯状态机
+    session.zig           会话引擎：喂字节+时间 → 出字节+事件（sans-io 的门面）
     stream.zig            TCP 流状态机、双层窗口
-    udp.zig               UDP 关联：中继 socket、丢弃队列、来源校验
+    udp.zig               UDP 关联状态：丢弃队列、来源校验规则（不含 socket）
     scheduler.zig         出站 round-robin + 控制帧优先
-    reader.zig            入站字节流 → 解码 → 重同步 → 帧（处理任意分片）
-  socks5.zig              SOCKS5 服务端解析器（增量式，含 UDP 头）
-  transport.zig           传输命令驱动：命令 / 交互 / 自定义三档（§12）
-  local.zig               本地模式：监听、拉起 transport、事件循环
-  serve.zig               远端模式：stdio、connect、事件循环
-  io/
+    socks5.zig            SOCKS5 服务端解析器（增量式，含 UDP 头）——纯状态机
+
+  io/                     ← 【第二层】POSIX I/O 运行时。可选：别人可整个不用
     poller.zig            poll(2) 事件循环封装
     tty.zig               isatty / cfmakeraw / 恢复
     pipe.zig              非阻塞读写、部分写处理
+    transport.zig         传输命令驱动：命令/交互/自定义三档（协议 §12），拉起 ssh
+    runtime.zig           把 core.Session 接到真实 fd 上，run(config) 的所在
+
+  cli/                    ← 【第三层】薄 binary
+    main.zig              解析 argv → 建 Config → 调 io.runtime.run → 错误映射退出码
+    args.zig             参数解析（-p / --key / --armor / -- 透传 …）
+
 tests/
   encoding_test.zig       四种编码往返 + 不变量(含派生哨兵) + 坏管道模拟
-  derive_test.zig         --key 派生 token/哨兵的确定性与安全性
+  derive_test.zig         key 派生 token/哨兵的确定性与安全性
   frame_test.zig          帧编解码 + 分片 + 畸形输入 + fuzz
   socks5_test.zig         SOCKS5 解析器 + 逐字节喂入 + UDP 头
-  session_test.zig        会话状态机、窗口、半关闭、降档
+  session_test.zig        会话引擎：握手、窗口、半关闭、降档（纯内存，无 fd）
   udp_test.zig            UDP 关联生命周期、丢弃策略、来源校验
+  freestanding_test.zig   断言 core/ 能对 freestanding 目标编译（守住"零 syscall"）
   e2e_test.zig            端到端：两个真实进程 + socketpair + 真实 TCP/UDP
 ```
 
+依赖方向是**单向**的：`cli → io → core`，`core` 谁都不依赖。
+任何一处 `core/` 里出现 `std.posix` / `std.net` / `std.process`，
+`freestanding_test.zig` 就会编译失败——这条红线由编译器守，不靠自觉。
+
+### 3.1 库 API 与复用边界
+
+别人 `@import("smodem")` 只看见 `root.zig` re-export 的这几样，分三个层次，
+按"想复用多少"各取所需：
+
+```zig
+// 层次一：开箱即用（薄 binary 走的就是这条）
+pub const Config = io.runtime.Config;      // 约定大于配置，Config{} 即默认可用
+pub fn run(alloc, config) Error!void       // 起一个完整隧道，阻塞直到结束
+
+// 层次二：sans-io 引擎（想用自己的 I/O 模型的人走这条）
+pub const Session = core.Session;          // 喂字节+时间，出字节+事件，不碰 fd
+pub const Event = core.Event;              // stream_open / data / close / log / ready …
+pub const Role = core.Role;                // .client / .server
+
+// 层次三：协议原语（只想要线格式的人走这条）
+pub const codec = core.codec;              // encoding / frame / address / crc32 / derive
+pub const socks5 = core.socks5;            // 单独的 SOCKS5 解析器
+pub const wire = core.wire;                // 常量：版本、帧类型、默认窗口 …
+```
+
+三条纪律让它"能被别人安心复用"，也是 code review 的硬标准：
+
+1. **调用方给 allocator。** 库内不藏全局分配器，任何分配都收 `std.mem.Allocator`。
+2. **库不打印、不退出。** 没有 `std.debug.print`，没有 `std.process.exit`。
+   诊断（探针失败、降档、重同步计数）作为 `Event.log{ level, msg }` **返回**给调用方，
+   由调用方决定写去哪。退出码是 `cli/` 把 `Error` 翻译出来的，不是库的事。
+3. **sans-io 内核零 syscall。** `core/` 只做纯计算，见上面那条编译期红线。
+
+`io/runtime.zig` 是"电池"——把 `Session` 接到 poll 循环和真实 socket 上，
+并把 `Event.log` 默认写到 stderr。想要不同 I/O 模型（epoll、io_uring、异步框架、
+甚至编译进浏览器 wasm）的人，跳过 `io/`，直接驱动 `Session` 即可。
+
 ## 4. 并发模型：单线程事件循环
 
-一个线程，一个 `poll(2)` 循环，管这些 fd：
+> 本节讲的是 `io/runtime.zig` 这一层——**内核（`core/`）本身不含任何并发或 I/O**，
+> 它只是被这个循环喂字节、要字节。换一个 I/O 模型，本节整段可以另写，内核不动。
+
+`io/runtime.zig` 用一个线程、一个 `poll(2)` 循环，管这些 fd：
 
 | fd | 事件 | 动作 |
 |---|---|---|
@@ -149,6 +192,10 @@ ESC 与 B64 解码器都必须能处理**任意分片**——一个转义序列�
 按最大帧 16 KiB 算是 32 KiB，单例，不随连接数增长。
 
 ## 6. CLI（约定大于配置）
+
+CLI 是**薄**的：`cli/main.zig` 只做三件事——解析 argv 成 `Config`、
+调 `smodem.run(alloc, config)`、把返回的 `Error` 翻译成退出码。
+没有任何协议逻辑漏在这一层；把 binary 整个删掉，库照样完整可用。
 
 ```
 smodem user@jumphost                  # 最常用：本地 1080 起 SOCKS5，自动拉 ssh
@@ -252,11 +299,37 @@ smodem -- ssh -J a@b c@d smodem serve # 完全自定义传输命令
 
 ## 8. 构建
 
+### 8.1 库与 binary 一个仓库、两个产物
+
+`build.zig` 同时产出两样，共用一份源码：
+
+```zig
+// 1) 库模块——别人作依赖时拿到的就是它
+const smodem = b.addModule("smodem", .{ .root_source_file = b.path("src/root.zig") });
+
+// 2) 薄可执行——只是把库接到 argv 和退出码上
+const exe = b.addExecutable(.{ .name = "smodem", ... });
+exe.root_module.addImport("smodem", smodem);
+```
+
+别人复用时，`build.zig.zon` 里加依赖，然后：
+
+```zig
+const smodem = b.dependency("smodem", .{}).module("smodem");
+my_exe.root_module.addImport("smodem", smodem);
+// 代码里：const smodem = @import("smodem"); try smodem.run(alloc, .{});
+```
+
+他们只会拿到 `root.zig` 暴露的稳定 API（§3.1），`core/` `io/` `cli/` 的内部结构
+可以随便重构而不惊动下游——这正是"薄 binary + 可复用库"要买的东西。
+
+### 8.2 编译要求
+
 **不出 Debug 产物。** 默认构建即 `ReleaseSafe`：
 
 ```
-zig build          # ReleaseSafe + baseline CPU（默认）
-zig build test     # 全部测试
+zig build          # ReleaseSafe + baseline CPU（默认），产出库 + binary
+zig build test     # 全部测试（含 freestanding 编译红线）
 zig build release  # 交叉编译多平台静态基线二进制到 zig-out/release/
 ```
 
