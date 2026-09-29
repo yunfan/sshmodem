@@ -157,6 +157,11 @@ fn runMain(init: std.process.Init) !u8 {
         const t = target orelse return usageErr();
         try argv.append(alloc, "ssh");
         try argv.append(alloc, "-T");
+        // ssh 传输层保活：沉默也每 15s 发一次，3 次没回应（45s）即判死断开，触发重连。
+        try argv.append(alloc, "-o");
+        try argv.append(alloc, "ServerAliveInterval=15");
+        try argv.append(alloc, "-o");
+        try argv.append(alloc, "ServerAliveCountMax=3");
         try argv.append(alloc, try alloc.dupeZ(u8, t));
         var it = std.mem.tokenizeScalar(u8, remote_cmd, ' ');
         while (it.next()) |tok| try argv.append(alloc, try alloc.dupeZ(u8, tok));

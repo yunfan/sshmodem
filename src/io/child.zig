@@ -55,3 +55,10 @@ pub fn spawn(argv: []const [:0]const u8, buf_argv: [][*:null]const ?[*:0]const u
     net.setNonBlock(out_pipe[0]);
     return .{ .pid = pid, .stdin_fd = in_pipe[1], .stdout_fd = out_pipe[0] };
 }
+
+/// 终止并回收子进程（避免僵尸）。重连前调用。
+pub fn stop(self: Child) void {
+    _ = c.kill(self.pid, .TERM);
+    var status: c_int = 0;
+    _ = c.waitpid(self.pid, &status, 0);
+}

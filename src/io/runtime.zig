@@ -83,6 +83,7 @@ const Runtime = struct {
     udp_by_stream: std.AutoHashMap(u32, *UdpAssoc),
     io_buf: [65536]u8 = undefined,
     running: bool = true,
+    ever_ready: bool = false, // 本次会话是否握手成功过（用于重连退避）
 
     fn log(self: *Runtime, comptime fmt: []const u8, args: anytype) void {
         if (self.cfg.verbose) std.debug.print("smodem: " ++ fmt ++ "\n", args);
@@ -156,7 +157,10 @@ const Runtime = struct {
 
 fn handleTunnelEvents(rt: *Runtime) !void {
     while (rt.tunnel.nextEvent()) |ev| switch (ev) {
-        .ready => rt.log("ready (send={s} recv={s})", .{ @tagName(rt.tunnel.txEncoding()), @tagName(rt.tunnel.rxEncoding()) }),
+        .ready => {
+            rt.ever_ready = true;
+            rt.log("ready (send={s} recv={s})", .{ @tagName(rt.tunnel.txEncoding()), @tagName(rt.tunnel.rxEncoding()) });
+        },
         .log => |l| if (rt.cfg.verbose) rt.log("[{s}] {s}", .{ @tagName(l.level), l.msg }),
         .stream_open => |x| try onStreamOpen(rt, x.id, x.metadata), // serve 侧：对端要开流
         .stream_accept => |x| try onStreamAccept(rt, x.id), // local 侧：远端接受了 CONNECT
@@ -681,12 +685,37 @@ pub fn run(alloc: Allocator, cfg: Config) RunError!void {
     }
 }
 
-fn runLocal(alloc: Allocator, cfg: Config) RunError!void {
-    const listen_fd = try net.listenTcp(cfg.listen_ip, cfg.listen_port);
-    errdefer net.close(listen_fd);
+fn sleepMs(ms: i32) void {
+    var none: [0]posix.pollfd = .{};
+    _ = posix.poll(&none, ms) catch {};
+}
 
+fn runLocal(alloc: Allocator, cfg: Config) RunError!void {
+    // SOCKS5 监听端口只开一次，跨重连始终保持——不影响上层代理（决策 D15）。
+    const listen_fd = try net.listenTcp(cfg.listen_ip, cfg.listen_port);
+    defer net.close(listen_fd);
+    if (cfg.verbose) std.debug.print("smodem: local mode: socks5 on {d}.{d}.{d}.{d}:{d}\n", .{ cfg.listen_ip[0], cfg.listen_ip[1], cfg.listen_ip[2], cfg.listen_ip[3], cfg.listen_port });
+
+    var backoff_ms: i32 = 1000;
+    while (true) {
+        const became_ready = runOneSession(alloc, cfg, listen_fd) catch |e| blk: {
+            if (cfg.verbose) std.debug.print("smodem: session error: {s}\n", .{@errorName(e)});
+            break :blk false;
+        };
+        // 传输断开：退避后重连。曾成功握手过则退避归位。
+        if (became_ready) backoff_ms = 1000;
+        if (cfg.verbose) std.debug.print("smodem: transport down, reconnecting in {d}ms\n", .{backoff_ms});
+        sleepMs(backoff_ms);
+        backoff_ms = @min(backoff_ms * 2, 30_000);
+    }
+}
+
+/// 跑一次传输会话：拉起 ssh、建隧道、事件循环，直到隧道断开。返回是否握手成功过。
+/// listen_fd 由调用方拥有，跨会话保持，本函数不关它。
+fn runOneSession(alloc: Allocator, cfg: Config, listen_fd: net.fd_t) RunError!bool {
     var argv_buf: [1][*:null]const ?[*:0]const u8 = undefined;
     const ch = child.spawn(cfg.transport_argv, &argv_buf) catch return error.TransportFailed;
+    defer child.stop(ch);
 
     var rt = Runtime{
         .alloc = alloc,
@@ -711,13 +740,17 @@ fn runLocal(alloc: Allocator, cfg: Config) RunError!void {
     }
     defer {
         for (rt.conns.items) |conn| {
+            net.close(conn.fd); // 断开旧客户端连接，让浏览器/ curl 重连（会被新会话接住）
             conn.deinit(alloc);
             alloc.destroy(conn);
         }
         rt.conns.deinit(alloc);
     }
-    rt.log("local mode: socks5 on {d}.{d}.{d}.{d}:{d}", .{ cfg.listen_ip[0], cfg.listen_ip[1], cfg.listen_ip[2], cfg.listen_ip[3], cfg.listen_port });
+    // 关闭子进程的管道 fd（stop 只杀进程；fd 由我们持有）。
+    defer net.close(rt.wire_in);
+    defer net.close(rt.wire_out);
     try eventLoop(&rt);
+    return rt.ever_ready;
 }
 
 fn runServe(alloc: Allocator, cfg: Config) RunError!void {
