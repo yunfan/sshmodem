@@ -88,4 +88,21 @@ while (t.nextEvent()) |ev| switch (ev) { ... }
 自带 I/O 模型）、`socks5`（SOCKS5↔隧道映射）、`codec`（协议原语）。
 详见 [docs/design.md §3.1](docs/design.md)。
 
-状态：设计完成，实现进行中。
+## 实现状态
+
+已完成并测试（45 单测 + 端到端 e2e 全绿）：
+
+- 第零层 codec：crc32 / derive / address / frame / encoding(RAW/ESC/B64/B32，参数化哨兵)
+- 第一层 tunnel：握手、SS 定界+CRC 重同步+冲刷、双层窗口流控+半关闭、
+  **自动降档探针**（每方向 RAW→ESC→B64）、**UDP 数据报通道**
+- 第二层 socks5：报文解析与应答
+- 第三层 io：poll(2) 事件循环、拉起 ssh、TCP connect、**UDP 中继**（含来源校验）
+- 第四层 cli：薄 binary
+- 构建：默认 ReleaseSafe + baseline，freestanding 红线守住 sans-io 三层零 syscall，
+  `zig build release` 出 4 平台静态 baseline 二进制
+
+命令：`zig build`（构建）、`zig build test`（全测试）、`zig build e2e`（端到端冒烟）、
+`zig build release`（多平台产物）。
+
+后续可做：探针的逐字节诊断输出（协议 §4.4，目前只按 CRC 判定通过/失败）、
+加固模式 `--armor` 的 CLI 接线（协议已定，库已支持派生哨兵/token）、交互式传输驱动。
