@@ -26,6 +26,14 @@ fn nowMs() i64 {
 
 pub const Mode = enum { local, serve };
 
+/// 静态 UDP 端口转发（协议 §9 之上）：本地 local_port 的 UDP 全部经隧道
+/// 送到服务端解析并发往固定的 host:port。类似 ssh -L 但走 UDP、目标固定。
+pub const UdpForward = struct {
+    local_port: u16,
+    host: []const u8, // IPv4 或域名（域名在服务端解析）
+    port: u16,
+};
+
 pub const Config = struct {
     mode: Mode = .local,
     listen_ip: [4]u8 = .{ 127, 0, 0, 1 },
@@ -33,6 +41,7 @@ pub const Config = struct {
     /// 传输命令 argv（local 模式）。默认由 CLI 拼 "ssh -T <target> smodem serve"。
     transport_argv: []const [:0]const u8 = &.{},
     tunnel: smodem.tunnel.Config = .{},
+    udp_forwards: []const UdpForward = &.{},
     verbose: bool = true,
 };
 
@@ -49,6 +58,27 @@ const UdpAssoc = struct {
     peer_set: bool = false, // local：是否已学到 curl 的 UDP 源
     peer_ip: [4]u8 = .{ 0, 0, 0, 0 },
     peer_port: u16 = 0,
+    open: bool = false, // 隧道数据报通道是否已被对端接受
+    pending: std.ArrayList(u8) = .empty, // 通道就绪前暂存（[u16 len][payload]…）
+};
+
+/// 一条静态 UDP 转发的本地监听（跨重连保持，由 runLocal 拥有）。
+const Forward = struct {
+    fd: net.fd_t, // 绑定 127.0.0.1:local_port 的 UDP socket
+    local_port: u16,
+    addr_block: [262]u8 = undefined, // 目标 ATYP+ADDR+PORT
+    addr_len: usize,
+};
+
+/// 某个客户端源在某条转发上的数据报关联（每会话；idle 超时回收）。
+const FwdAssoc = struct {
+    stream_id: u32,
+    fwd: *Forward,
+    cli_ip: [4]u8,
+    cli_port: u16,
+    last_ms: i64,
+    open: bool = false, // 隧道数据报通道是否已被对端接受
+    pending: std.ArrayList(u8) = .empty, // 通道就绪前暂存的载荷（[u16 len][payload]…）
 };
 
 const Conn = struct {
@@ -81,6 +111,9 @@ const Runtime = struct {
     by_stream: std.AutoHashMap(u32, *Conn),
     udp: std.ArrayList(*UdpAssoc) = .empty,
     udp_by_stream: std.AutoHashMap(u32, *UdpAssoc),
+    forwards: []Forward = &.{}, // 跨重连保持，由 runLocal 拥有
+    fwd_assocs: std.ArrayList(*FwdAssoc) = .empty,
+    fwd_by_stream: std.AutoHashMap(u32, *FwdAssoc),
     io_buf: [65536]u8 = undefined,
     running: bool = true,
     ever_ready: bool = false, // 本次会话是否握手成功过（用于重连退避）
@@ -262,6 +295,10 @@ fn onStreamReset(rt: *Runtime, id: u32) void {
         closeUdp(rt, ua); // 对端结束了 UDP 关联
         return;
     }
+    if (rt.fwd_by_stream.get(id)) |fa| {
+        closeFwdAssoc(rt, fa);
+        return;
+    }
     const conn = connByStream(rt, id) orelse return;
     conn.dead = true;
 }
@@ -281,11 +318,16 @@ fn onDatagramOpen(rt: *Runtime, id: u32, metadata: []const u8) !void {
     try rt.tunnel.acceptDatagram(id, "\x01\x00\x00\x00\x00\x00\x00");
 }
 
-// local 侧：远端已绑 UDP（关联建立确认）。本地无需动作（relay 已就绪）。
+// local 侧：远端已绑 UDP（通道被接受）→ 冲刷通道就绪前暂存的数据报。
 fn onDatagramAccept(rt: *Runtime, id: u32, metadata: []const u8) !void {
-    _ = rt;
-    _ = id;
     _ = metadata;
+    if (rt.udp_by_stream.get(id)) |ua| {
+        ua.open = true;
+        dgramFlush(rt, id, &ua.pending);
+    } else if (rt.fwd_by_stream.get(id)) |fa| {
+        fa.open = true;
+        dgramFlush(rt, id, &fa.pending);
+    }
 }
 
 fn onDatagramReject(rt: *Runtime, id: u32, code: u8) void {
@@ -295,11 +337,16 @@ fn onDatagramReject(rt: *Runtime, id: u32, code: u8) void {
 
 // 收到一个数据报。payload = 地址块 + 数据（socks5 层语义，协议 §9.2）。
 fn onDatagram(rt: *Runtime, id: u32, payload: []const u8) !void {
-    const ua = rt.udp_by_stream.get(id) orelse return;
     if (rt.cfg.mode == .serve) {
+        const ua = rt.udp_by_stream.get(id) orelse return;
         try serveSendDatagram(rt, ua, payload);
-    } else {
+        return;
+    }
+    // local：可能是 SOCKS5 UDP 关联，或静态转发关联。
+    if (rt.udp_by_stream.get(id)) |ua| {
         localReturnDatagram(rt, ua, payload);
+    } else if (rt.fwd_by_stream.get(id)) |fa| {
+        localReturnForward(rt, fa, payload);
     }
 }
 
@@ -312,6 +359,7 @@ fn closeUdp(rt: *Runtime, ua: *UdpAssoc) void {
             break;
         }
     }
+    ua.pending.deinit(rt.alloc);
     rt.alloc.destroy(ua);
 }
 
@@ -368,7 +416,7 @@ fn localRelayReadable(rt: *Runtime, ua: *UdpAssoc) !void {
         if (r.n < 3) continue;
         if (buf[2] != 0) continue; // FRAG != 0 丢弃（协议 §9.2）
         // buf[3..n] = ATYP+ADDR+PORT+DATA，正是隧道数据报载荷。
-        _ = rt.tunnel.sendDatagram(ua.stream_id, buf[3..r.n]) catch {};
+        dgramSend(rt, ua.stream_id, ua.open, &ua.pending, buf[3..r.n]);
     }
 }
 
@@ -383,6 +431,111 @@ fn serveTargetReadable(rt: *Runtime, ua: *UdpAssoc) !void {
         @memcpy(payload[alen .. alen + r.n], buf[0..r.n]);
         _ = rt.tunnel.sendDatagram(ua.stream_id, payload[0 .. alen + r.n]) catch {};
     }
+}
+
+// ===================== 静态 UDP 转发（local） =====================
+
+fn findForwardByFd(rt: *Runtime, fd: net.fd_t) ?*Forward {
+    for (rt.forwards) |*f| if (f.fd == fd) return f;
+    return null;
+}
+
+fn findFwdAssoc(rt: *Runtime, fwd: *Forward, ip: [4]u8, port: u16) ?*FwdAssoc {
+    for (rt.fwd_assocs.items) |fa| {
+        if (fa.fwd == fwd and fa.cli_port == port and std.mem.eql(u8, &fa.cli_ip, &ip)) return fa;
+    }
+    return null;
+}
+
+fn closeFwdAssoc(rt: *Runtime, fa: *FwdAssoc) void {
+    _ = rt.fwd_by_stream.remove(fa.stream_id);
+    for (rt.fwd_assocs.items, 0..) |p, i| {
+        if (p == fa) {
+            _ = rt.fwd_assocs.swapRemove(i);
+            break;
+        }
+    }
+    fa.pending.deinit(rt.alloc);
+    rt.alloc.destroy(fa);
+}
+
+// 数据报缓冲：通道就绪（open）直接发；否则暂存 [u16 len][payload]，
+// 等 datagram_accept 后由 dgramFlush 冲刷。解决"通道接受前首包被丢"的竞态。
+fn dgramSend(rt: *Runtime, stream_id: u32, open: bool, pending: *std.ArrayList(u8), payload: []const u8) void {
+    if (open) {
+        _ = rt.tunnel.sendDatagram(stream_id, payload) catch {};
+    } else if (pending.items.len + payload.len + 2 <= 64 * 1024) {
+        var lb: [2]u8 = undefined;
+        std.mem.writeInt(u16, &lb, @intCast(payload.len), .little);
+        pending.appendSlice(rt.alloc, &lb) catch return;
+        pending.appendSlice(rt.alloc, payload) catch return;
+    } // 否则丢弃（暂存已满，符合 UDP 可丢语义）
+}
+
+fn dgramFlush(rt: *Runtime, stream_id: u32, pending: *std.ArrayList(u8)) void {
+    var off: usize = 0;
+    while (off + 2 <= pending.items.len) {
+        const n = std.mem.readInt(u16, pending.items[off..][0..2], .little);
+        off += 2;
+        if (off + n > pending.items.len) break;
+        _ = rt.tunnel.sendDatagram(stream_id, pending.items[off .. off + n]) catch {};
+        off += n;
+    }
+    pending.clearAndFree(rt.alloc);
+}
+
+// 转发监听可读：收客户端 UDP → 找/建关联 → 载荷 = 目标地址块 + 数据 → 送隧道。
+fn fwdReadable(rt: *Runtime, fwd: *Forward) !void {
+    var buf: [70000]u8 = undefined;
+    while (net.recvFrom4(fwd.fd, &buf)) |r| {
+        var fa = findFwdAssoc(rt, fwd, r.ip4, r.port);
+        if (fa == null) {
+            if (!rt.tunnel.isReady()) continue; // 隧道未就绪，丢弃
+            const id = rt.tunnel.openDatagram(fwd.addr_block[0..fwd.addr_len]) catch continue;
+            const na = try rt.alloc.create(FwdAssoc);
+            na.* = .{ .stream_id = id, .fwd = fwd, .cli_ip = r.ip4, .cli_port = r.port, .last_ms = nowMs() };
+            try rt.fwd_assocs.append(rt.alloc, na);
+            try rt.fwd_by_stream.put(id, na);
+            fa = na;
+        }
+        // 载荷 = 目标地址块 + 客户端数据。
+        var payload: [70300]u8 = undefined;
+        if (fwd.addr_len + r.n > payload.len) continue;
+        @memcpy(payload[0..fwd.addr_len], fwd.addr_block[0..fwd.addr_len]);
+        @memcpy(payload[fwd.addr_len .. fwd.addr_len + r.n], buf[0..r.n]);
+        dgramSend(rt, fa.?.stream_id, fa.?.open, &fa.?.pending, payload[0 .. fwd.addr_len + r.n]);
+        fa.?.last_ms = nowMs();
+    }
+}
+
+// 隧道回来的数据报（服务端→本地）：载荷 = 源地址块 + 数据 → 剥地址 → 发回客户端。
+fn localReturnForward(rt: *Runtime, fa: *FwdAssoc, payload: []const u8) void {
+    const dec = address.decode(payload) catch return;
+    const data = payload[dec.consumed..];
+    net.sendTo4(fa.fwd.fd, data, fa.cli_ip, fa.cli_port);
+    fa.last_ms = nowMs();
+    _ = rt;
+}
+
+// —— 从 host 字符串 + 端口构造 RFC1928 地址块 ——
+fn parseIp4(s: []const u8) ?[4]u8 {
+    var out: [4]u8 = undefined;
+    var it = std.mem.splitScalar(u8, s, '.');
+    var i: usize = 0;
+    while (it.next()) |part| {
+        if (i >= 4) return null;
+        out[i] = std.fmt.parseInt(u8, part, 10) catch return null;
+        i += 1;
+    }
+    return if (i == 4) out else null;
+}
+
+fn buildAddrBlock(out: []u8, host: []const u8, port: u16) ?usize {
+    if (parseIp4(host)) |ip| {
+        return (address.Address{ .host = .{ .ipv4 = ip }, .port = port }).encode(out);
+    }
+    if (host.len == 0 or host.len > 255) return null;
+    return (address.Address{ .host = .{ .domain = host }, .port = port }).encode(out);
 }
 
 // ===================== SOCKS5 握手（local） =====================
@@ -559,6 +712,9 @@ fn eventLoop(rt: *Runtime) !void {
         // UDP relay / target socket
         for (rt.udp.items) |ua|
             try pollfds.append(rt.alloc, .{ .fd = ua.fd, .events = POLLIN, .revents = 0 });
+        // 静态 UDP 转发监听
+        for (rt.forwards) |*f|
+            try pollfds.append(rt.alloc, .{ .fd = f.fd, .events = POLLIN, .revents = 0 });
 
         _ = posix.poll(pollfds.items, 1000) catch 0;
 
@@ -583,6 +739,8 @@ fn eventLoop(rt: *Runtime) !void {
                 if ((pfd.revents & POLLIN) != 0) {
                     if (rt.cfg.mode == .serve) try serveTargetReadable(rt, ua) else try localRelayReadable(rt, ua);
                 }
+            } else if (findForwardByFd(rt, pfd.fd)) |fwd| {
+                if ((pfd.revents & POLLIN) != 0) try fwdReadable(rt, fwd);
             } else {
                 // conn fd
                 const conn = findConnByFd(rt, pfd.fd) orelse continue;
@@ -652,6 +810,17 @@ fn eventLoop(rt: *Runtime) !void {
                 rt.log("tunnel closed: {s}", .{@errorName(e)});
                 rt.running = false;
             };
+            // 静态转发关联 idle 回收（60s 无流量 → 结束隧道数据报通道）。
+            var fi: usize = 0;
+            while (fi < rt.fwd_assocs.items.len) {
+                const fa = rt.fwd_assocs.items[fi];
+                if (now - fa.last_ms >= 60_000) {
+                    rt.tunnel.reset(fa.stream_id, 0) catch {};
+                    closeFwdAssoc(rt, fa);
+                    continue;
+                }
+                fi += 1;
+            }
         }
     }
 }
@@ -696,9 +865,24 @@ fn runLocal(alloc: Allocator, cfg: Config) RunError!void {
     defer net.close(listen_fd);
     if (cfg.verbose) std.debug.print("smodem: local mode: socks5 on {d}.{d}.{d}.{d}:{d}\n", .{ cfg.listen_ip[0], cfg.listen_ip[1], cfg.listen_ip[2], cfg.listen_ip[3], cfg.listen_port });
 
+    // 静态 UDP 转发监听：同样只开一次、跨重连保持。
+    const forwards = try alloc.alloc(Forward, cfg.udp_forwards.len);
+    defer {
+        for (forwards) |f| net.close(f.fd);
+        alloc.free(forwards);
+    }
+    for (cfg.udp_forwards, 0..) |spec, i| {
+        const fd = try net.udpSocket();
+        errdefer net.close(fd);
+        try net.udpBind(fd, cfg.listen_ip, spec.local_port);
+        forwards[i] = .{ .fd = fd, .local_port = spec.local_port, .addr_len = 0 };
+        forwards[i].addr_len = buildAddrBlock(&forwards[i].addr_block, spec.host, spec.port) orelse return error.SetupFailed;
+        if (cfg.verbose) std.debug.print("smodem: udp forward {d} -> {s}:{d}\n", .{ spec.local_port, spec.host, spec.port });
+    }
+
     var backoff_ms: i32 = 1000;
     while (true) {
-        const became_ready = runOneSession(alloc, cfg, listen_fd) catch |e| blk: {
+        const became_ready = runOneSession(alloc, cfg, listen_fd, forwards) catch |e| blk: {
             if (cfg.verbose) std.debug.print("smodem: session error: {s}\n", .{@errorName(e)});
             break :blk false;
         };
@@ -712,7 +896,7 @@ fn runLocal(alloc: Allocator, cfg: Config) RunError!void {
 
 /// 跑一次传输会话：拉起 ssh、建隧道、事件循环，直到隧道断开。返回是否握手成功过。
 /// listen_fd 由调用方拥有，跨会话保持，本函数不关它。
-fn runOneSession(alloc: Allocator, cfg: Config, listen_fd: net.fd_t) RunError!bool {
+fn runOneSession(alloc: Allocator, cfg: Config, listen_fd: net.fd_t, forwards: []Forward) RunError!bool {
     var argv_buf: [1][*:null]const ?[*:0]const u8 = undefined;
     const ch = child.spawn(cfg.transport_argv, &argv_buf) catch return error.TransportFailed;
     defer child.stop(ch);
@@ -726,14 +910,25 @@ fn runOneSession(alloc: Allocator, cfg: Config, listen_fd: net.fd_t) RunError!bo
         .listen_fd = listen_fd,
         .by_stream = std.AutoHashMap(u32, *Conn).init(alloc),
         .udp_by_stream = std.AutoHashMap(u32, *UdpAssoc).init(alloc),
+        .forwards = forwards,
+        .fwd_by_stream = std.AutoHashMap(u32, *FwdAssoc).init(alloc),
     };
     defer rt.tunnel.deinit();
     defer rt.wire_obuf.deinit(alloc);
     defer rt.by_stream.deinit();
     defer rt.udp_by_stream.deinit();
+    defer rt.fwd_by_stream.deinit();
+    defer {
+        for (rt.fwd_assocs.items) |fa| {
+            fa.pending.deinit(alloc);
+            alloc.destroy(fa);
+        }
+        rt.fwd_assocs.deinit(alloc);
+    }
     defer {
         for (rt.udp.items) |ua| {
             net.close(ua.fd);
+            ua.pending.deinit(alloc);
             alloc.destroy(ua);
         }
         rt.udp.deinit(alloc);
@@ -764,14 +959,17 @@ fn runServe(alloc: Allocator, cfg: Config) RunError!void {
         .wire_out = 1,
         .by_stream = std.AutoHashMap(u32, *Conn).init(alloc),
         .udp_by_stream = std.AutoHashMap(u32, *UdpAssoc).init(alloc),
+        .fwd_by_stream = std.AutoHashMap(u32, *FwdAssoc).init(alloc),
     };
     defer rt.tunnel.deinit();
     defer rt.wire_obuf.deinit(alloc);
     defer rt.by_stream.deinit();
     defer rt.udp_by_stream.deinit();
+    defer rt.fwd_by_stream.deinit();
     defer {
         for (rt.udp.items) |ua| {
             net.close(ua.fd);
+            ua.pending.deinit(alloc);
             alloc.destroy(ua);
         }
         rt.udp.deinit(alloc);

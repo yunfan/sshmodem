@@ -15,6 +15,7 @@ const usage =
     \\
     \\Options (local):
     \\  -p, --port <n>        local SOCKS5 port (default 1080)
+    \\  -U, --udp <l:h:p>     static UDP forward: local port l -> remote h:p (repeatable)
     \\      --remote-cmd <s>  remote command (default "smodem serve")
     \\      --encoding <e>    raw|esc|b64|b32 (default: auto-probe)
     \\      --key <secret>    derive a per-session handshake marker (not a secret channel)
@@ -48,6 +49,18 @@ fn parseEncoding(s: []const u8) ?smodem.tunnel.Encoding {
     return null;
 }
 
+/// 解析 "localport:host:port"（host 可为 IPv4 或域名；域名在服务端解析）。
+fn parseUdpForward(s: []const u8) ?rt.UdpForward {
+    const first = std.mem.indexOfScalar(u8, s, ':') orelse return null;
+    const last = std.mem.lastIndexOfScalar(u8, s, ':') orelse return null;
+    if (last <= first) return null;
+    const lp = std.fmt.parseInt(u16, s[0..first], 10) catch return null;
+    const host = s[first + 1 .. last];
+    const tp = std.fmt.parseInt(u16, s[last + 1 ..], 10) catch return null;
+    if (host.len == 0) return null;
+    return .{ .local_port = lp, .host = host, .port = tp };
+}
+
 fn parseSentinel(s: []const u8) ?u8 {
     if (s.len == 1) return s[0];
     if (s.len == 4 and (std.mem.eql(u8, s[0..2], "0x") or std.mem.eql(u8, s[0..2], "0X")))
@@ -70,6 +83,8 @@ fn runMain(init: std.process.Init) !u8 {
     var key: ?[]const u8 = null;
     var marker: ?[]const u8 = null;
     var sentinel_arg: ?u8 = null;
+    var udp_forwards: std.ArrayList(rt.UdpForward) = .empty;
+    defer udp_forwards.deinit(alloc);
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -108,6 +123,10 @@ fn runMain(init: std.process.Init) !u8 {
             i += 1;
             if (i >= args.len) return usageErr();
             sentinel_arg = parseSentinel(args[i]) orelse return usageErr();
+        } else if (std.mem.eql(u8, a, "--udp") or std.mem.eql(u8, a, "-U")) {
+            i += 1;
+            if (i >= args.len) return usageErr();
+            try udp_forwards.append(alloc, parseUdpForward(args[i]) orelse return usageErr());
         } else if (std.mem.eql(u8, a, "--")) {
             custom = args[i + 1 ..];
             break;
@@ -140,6 +159,7 @@ fn runMain(init: std.process.Init) !u8 {
     }
     if (!encoding_forced) cfg.tunnel.auto_probe = true;
     cfg.tunnel.caps = smodem.tunnel.caps.udp_associate;
+    cfg.udp_forwards = udp_forwards.items;
 
     if (cfg.mode == .serve) {
         try rt.run(alloc, cfg);

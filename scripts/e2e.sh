@@ -64,5 +64,25 @@ SM=$!; sleep 1
 if python3 scripts/udp_e2e.py "$PORT" >/tmp/udp.out 2>&1; then echo "  ok  udp associate echo"; else echo "  FAIL udp associate"; cat /tmp/udp.out; FAIL=1; fi
 kill $SM 2>/dev/null; wait $SM 2>/dev/null
 
+echo "== udp forward =="
+UECHO=$(( 20000 + RANDOM % 20000 )); LFWD=$(( 20000 + RANDOM % 20000 ))
+python3 -c "
+import socket
+s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.bind(('127.0.0.1',$UECHO))
+while True:
+    d,a=s.recvfrom(2048); s.sendto(b'E:'+d,a)
+" &
+UP=$!; sleep 1
+"$BIN" -q -p "$PORT" --udp $LFWD:127.0.0.1:$UECHO -- "$BIN" serve >"$TMP/sm.log" 2>&1 &
+SM=$!; sleep 1
+if python3 -c "
+import socket
+u=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); u.settimeout(5)
+u.sendto(b'ping',('127.0.0.1',$LFWD)); d,_=u.recvfrom(2048)
+assert d==b'E:ping', d
+print('ok')
+" >/dev/null 2>&1; then echo "  ok  udp static forward"; else echo "  FAIL udp static forward"; FAIL=1; fi
+kill $SM $UP 2>/dev/null; wait $SM 2>/dev/null
+
 if [ "$FAIL" = 0 ]; then echo "E2E: ALL PASS"; else echo "E2E: FAILURES"; fi
 exit $FAIL
