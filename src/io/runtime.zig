@@ -36,6 +36,7 @@ pub const UdpForward = struct {
 
 pub const Config = struct {
     mode: Mode = .local,
+    socks5_listen: bool = true, // 关掉则只跑 UDP 转发，不开 SOCKS5 端口
     listen_ip: [4]u8 = .{ 127, 0, 0, 1 },
     listen_port: u16 = 1080,
     /// 传输命令 argv（local 模式）。默认由 CLI 拼 "ssh -T <target> smodem serve"。
@@ -861,9 +862,15 @@ fn sleepMs(ms: i32) void {
 
 fn runLocal(alloc: Allocator, cfg: Config) RunError!void {
     // SOCKS5 监听端口只开一次，跨重连始终保持——不影响上层代理（决策 D15）。
-    const listen_fd = try net.listenTcp(cfg.listen_ip, cfg.listen_port);
-    defer net.close(listen_fd);
-    if (cfg.verbose) std.debug.print("smodem: local mode: socks5 on {d}.{d}.{d}.{d}:{d}\n", .{ cfg.listen_ip[0], cfg.listen_ip[1], cfg.listen_ip[2], cfg.listen_ip[3], cfg.listen_port });
+    // 关掉 SOCKS5 时（只跑 UDP 转发）不开这个口。
+    const listen_fd: ?net.fd_t = if (cfg.socks5_listen) try net.listenTcp(cfg.listen_ip, cfg.listen_port) else null;
+    defer if (listen_fd) |lf| net.close(lf);
+    if (cfg.verbose) {
+        if (listen_fd != null)
+            std.debug.print("smodem: local mode: socks5 on {d}.{d}.{d}.{d}:{d}\n", .{ cfg.listen_ip[0], cfg.listen_ip[1], cfg.listen_ip[2], cfg.listen_ip[3], cfg.listen_port })
+        else
+            std.debug.print("smodem: local mode: udp-forward only (socks5 disabled)\n", .{});
+    }
 
     // 静态 UDP 转发监听：同样只开一次、跨重连保持。
     const forwards = try alloc.alloc(Forward, cfg.udp_forwards.len);
@@ -896,7 +903,7 @@ fn runLocal(alloc: Allocator, cfg: Config) RunError!void {
 
 /// 跑一次传输会话：拉起 ssh、建隧道、事件循环，直到隧道断开。返回是否握手成功过。
 /// listen_fd 由调用方拥有，跨会话保持，本函数不关它。
-fn runOneSession(alloc: Allocator, cfg: Config, listen_fd: net.fd_t, forwards: []Forward) RunError!bool {
+fn runOneSession(alloc: Allocator, cfg: Config, listen_fd: ?net.fd_t, forwards: []Forward) RunError!bool {
     var argv_buf: [1][*:null]const ?[*:0]const u8 = undefined;
     const ch = child.spawn(cfg.transport_argv, &argv_buf) catch return error.TransportFailed;
     defer child.stop(ch);

@@ -112,6 +112,7 @@ while (t.nextEvent()) |ev| switch (ev) { ... }
 
 静态 UDP 端口转发：`-U/--udp localport:host:port`（可重复）——本地 UDP 端口经隧道
 映射到服务端能到的固定 host:port（类似 ssh -L 但走 UDP、目标固定；host 为域名时远端解析）。
+`--no-socks`（或 `-p 0`）可只跑 UDP 转发、不开 SOCKS5 口。
 
 连接保活与自愈：默认 ssh 命令带 `ServerAliveInterval=15 ServerAliveCountMax=3`
 （沉默也发保活、死链 45s 内探明）；传输一旦断开自动重连（指数退避 1→30s），

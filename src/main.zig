@@ -16,6 +16,7 @@ const usage =
     \\Options (local):
     \\  -p, --port <n>        local SOCKS5 port (default 1080)
     \\  -U, --udp <l:h:p>     static UDP forward: local port l -> remote h:p (repeatable)
+    \\      --no-socks        do not open the SOCKS5 port (UDP-forward-only); same as -p 0
     \\      --remote-cmd <s>  remote command (default "smodem serve")
     \\      --encoding <e>    raw|esc|b64|b32 (default: auto-probe)
     \\      --key <secret>    derive a per-session handshake marker (not a secret channel)
@@ -127,6 +128,8 @@ fn runMain(init: std.process.Init) !u8 {
             i += 1;
             if (i >= args.len) return usageErr();
             try udp_forwards.append(alloc, parseUdpForward(args[i]) orelse return usageErr());
+        } else if (std.mem.eql(u8, a, "--no-socks")) {
+            cfg.socks5_listen = false;
         } else if (std.mem.eql(u8, a, "--")) {
             custom = args[i + 1 ..];
             break;
@@ -160,6 +163,13 @@ fn runMain(init: std.process.Init) !u8 {
     if (!encoding_forced) cfg.tunnel.auto_probe = true;
     cfg.tunnel.caps = smodem.tunnel.caps.udp_associate;
     cfg.udp_forwards = udp_forwards.items;
+    // -p 0 视作关闭 SOCKS5（只跑 UDP 转发）。
+    if (cfg.listen_port == 0) cfg.socks5_listen = false;
+    // local 模式下，SOCKS5 和 UDP 转发不能都没有。
+    if (cfg.mode == .local and !cfg.socks5_listen and udp_forwards.items.len == 0) {
+        std.debug.print("smodem: nothing to do — enable SOCKS5 or add --udp\n", .{});
+        return @intFromEnum(ExitCode.usage);
+    }
 
     if (cfg.mode == .serve) {
         try rt.run(alloc, cfg);
