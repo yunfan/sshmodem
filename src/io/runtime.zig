@@ -118,6 +118,7 @@ const Runtime = struct {
     forwards: []Forward = &.{}, // 跨重连保持，由 runLocal 拥有
     fwd_assocs: std.ArrayList(*FwdAssoc) = .empty,
     fwd_by_stream: std.AutoHashMap(u32, *FwdAssoc),
+    preamble_left: usize = 0, // push 二进制还剩多少没写上线（>0 期间不走握手计时）
     io_buf: [65536]u8 = undefined,
     running: bool = true,
     ever_ready: bool = false, // 本次会话是否握手成功过（用于重连退避）
@@ -157,6 +158,7 @@ const Runtime = struct {
         switch (net.writeFd(self.wire_out, self.wire_obuf.items)) {
             .n => |w| {
                 if (w > 0) {
+                    self.preamble_left -|= w; // push 上传进度（不计入握手超时）
                     const rem = self.wire_obuf.items.len - w;
                     if (rem > 0) std.mem.copyForwards(u8, self.wire_obuf.items[0..rem], self.wire_obuf.items[w..]);
                     self.wire_obuf.shrinkRetainingCapacity(rem);
@@ -806,9 +808,10 @@ fn eventLoop(rt: *Runtime) !void {
             i += 1;
         }
 
-        // 定期 tick
+        // 定期 tick。push 二进制还在上线时（preamble_left>0）不 tick——
+        // 否则握手计时会把上传时间也算进去，大二进制/慢链路会误超时。
         const now = nowMs();
-        if (now - last_tick >= 500) {
+        if (rt.preamble_left == 0 and now - last_tick >= 500) {
             last_tick = now;
             rt.tunnel.tick(@intCast(now)) catch |e| {
                 rt.log("tunnel closed: {s}", .{@errorName(e)});
@@ -955,7 +958,10 @@ fn runOneSession(alloc: Allocator, cfg: Config, listen_fd: ?net.fd_t, forwards: 
     defer net.close(rt.wire_in);
     defer net.close(rt.wire_out);
     // push 模式：协议流之前先把二进制（base64）顶到线上。
-    if (cfg.preamble.len > 0) try rt.wire_obuf.appendSlice(alloc, cfg.preamble);
+    if (cfg.preamble.len > 0) {
+        try rt.wire_obuf.appendSlice(alloc, cfg.preamble);
+        rt.preamble_left = cfg.preamble.len; // 这段写完前不计握手超时
+    }
     try eventLoop(&rt);
     return rt.ever_ready;
 }
