@@ -520,3 +520,32 @@ usage.md 给出 `scp` 与 `cat | ssh` 两条现成命令。
 自然间隔侥幸躲过，其实是同一个竞态，一并修掉，UDP 关联端到端从偶发变稳定。
 
 **放弃**：不做会话恢复/可靠重传（UDP 本就可丢）；暂存满即丢（符合 UDP 语义）。
+
+---
+
+## D30 · --push：同连接内自举上传二进制（对付即创即用的临时容器）
+**2026-10-01 · 已定，部分修订 D21**
+
+用户场景：有些 ssh host 按登录信息**每次连接自动新建容器**，无法预装 smodem，
+且每次可能是不同容器。D21 的"自己 scp"在这里不成立——必须在**同一条 ssh 连接**
+里把二进制传过去并跑起来（分两次连是两个容器）。
+
+做法 `--push <bin|self>`：同一条 stdin 上先发 `base64(binary)`、再发协议流；远端用
+
+    f=$(mktemp) && dd bs=1 count=N 2>/dev/null | base64 -d > "$f" && chmod +x "$f" && exec "$f" serve …
+
+**切分靠 `dd bs=1 count=N`**：实测 busybox 的 `head -c` 会多读、把协议头几个字节吞掉，
+而 `dd bs=1 count=N` 在 GNU 与 busybox 下都精确不越读（共享文件偏移停在交界处，
+exec 后的 serve 正好接着读协议），读 ~630KB 仅 ~0.8s。base64 用于穿透（无换行，
+躲开 ONLCR/ISTRIP；busybox 也有 base64 -d）。
+
+- 二进制由 `cfg.preamble` 承载，**每条会话（每次重连/每个新容器）重传一次**；
+- `self` = /proc/self/exe（本机即远端同平台时方便）；否则给一个**远端架构**的二进制；
+- 握手参数（marker/sentinel/encoding）拼进 bootstrap 的 serve 后缀，两端一致。
+
+**提醒**：push 上传量 = 二进制大小 ×1.33。用 release 的 strip 版（linux musl ~470KB →
+base64 ~630KB）比不 strip 的开发版（~4MB）快得多。
+
+**放弃**：远端架构自动探测（需先连一次跑 uname，但容器可能每次不同，不可靠）。
+由用户给对的二进制。canonical-pty 强制行缓冲的极端 host 下 push 可能卡（无换行的
+base64 不被行缓冲放行）——但命令模式(`ssh -T host cmd`)通常不分配 pty，属罕见。

@@ -110,6 +110,10 @@ while (t.nextEvent()) |ev| switch (ev) { ... }
 
 探针不透明时会打逐字节诊断（协议 §4.4）：方向、收发长度差、首个差异字节、根因推断。
 
+自举部署 `--push <bin|self>`：远端没预装 smodem（如一连接就新建的临时容器）时，
+每次连接自动把一个二进制经同一条 ssh stdin 传过去并跑 serve（`dd` 精确切分 + base64 穿透）。
+`<bin>` 要匹配远端架构，或 `self` 用本机二进制。建议用 strip 的 release 版（上传更小）。
+
 静态 UDP 端口转发：`-U/--udp localport:host:port`（可重复）——本地 UDP 端口经隧道
 映射到服务端能到的固定 host:port（类似 ssh -L 但走 UDP、目标固定；host 为域名时远端解析）。
 `--no-socks`（或 `-p 0`）可只跑 UDP 转发、不开 SOCKS5 口。

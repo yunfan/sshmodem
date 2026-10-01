@@ -43,6 +43,9 @@ pub const Config = struct {
     transport_argv: []const [:0]const u8 = &.{},
     tunnel: smodem.tunnel.Config = .{},
     udp_forwards: []const UdpForward = &.{},
+    /// 连接建立后、协议流之前先写给远端的字节（push 模式：base64 的 smodem 二进制）。
+    /// 每条会话（每次重连/每个新容器）都会重发一次。
+    preamble: []const u8 = &.{},
     verbose: bool = true,
 };
 
@@ -951,6 +954,8 @@ fn runOneSession(alloc: Allocator, cfg: Config, listen_fd: ?net.fd_t, forwards: 
     // 关闭子进程的管道 fd（stop 只杀进程；fd 由我们持有）。
     defer net.close(rt.wire_in);
     defer net.close(rt.wire_out);
+    // push 模式：协议流之前先把二进制（base64）顶到线上。
+    if (cfg.preamble.len > 0) try rt.wire_obuf.appendSlice(alloc, cfg.preamble);
     try eventLoop(&rt);
     return rt.ever_ready;
 }

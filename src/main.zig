@@ -17,6 +17,9 @@ const usage =
     \\  -p, --port <n>        local SOCKS5 port (default 1080)
     \\  -U, --udp <l:h:p>     static UDP forward: local port l -> remote h:p (repeatable)
     \\      --no-socks        do not open the SOCKS5 port (UDP-forward-only); same as -p 0
+    \\      --push <bin|self> upload a smodem binary each connection and run serve
+    \\                        (for hosts with no pre-installed smodem, e.g. ephemeral
+    \\                        containers); <bin> is a remote-arch binary, or "self"
     \\      --remote-cmd <s>  remote command (default "smodem serve")
     \\      --encoding <e>    raw|esc|b64|b32 (default: auto-probe)
     \\      --key <secret>    derive a per-session handshake marker (not a secret channel)
@@ -48,6 +51,45 @@ fn parseEncoding(s: []const u8) ?smodem.tunnel.Encoding {
     if (std.mem.eql(u8, s, "b64")) return .b64;
     if (std.mem.eql(u8, s, "b32")) return .b32;
     return null;
+}
+
+/// 读整个文件到内存（经 libc；"self" → /proc/self/exe，即本机正在跑的二进制）。
+fn readFileAll(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
+    const c = std.c;
+    const real = if (std.mem.eql(u8, path, "self")) "/proc/self/exe" else path;
+    const path_z = try alloc.dupeZ(u8, real);
+    defer alloc.free(path_z);
+    const fd = c.open(path_z.ptr, .{});
+    if (fd < 0) return error.OpenFailed;
+    defer _ = c.close(fd);
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(alloc);
+    var buf: [65536]u8 = undefined;
+    while (true) {
+        const n = c.read(fd, &buf, buf.len);
+        if (n < 0) return error.ReadFailed;
+        if (n == 0) break;
+        try list.appendSlice(alloc, buf[0..@intCast(n)]);
+    }
+    return list.toOwnedSlice(alloc);
+}
+
+/// push 模式下 "serve" 后要附加的握手参数后缀（与 appendResolved 同条件）。
+fn buildServeSuffix(arena: std.mem.Allocator, cfg: rt.Config, encoding_forced: bool) ![]const u8 {
+    var s: std.ArrayList(u8) = .empty;
+    if (!std.mem.eql(u8, cfg.tunnel.token, derive.default_token)) {
+        try s.appendSlice(arena, " --marker ");
+        try s.appendSlice(arena, cfg.tunnel.token);
+    }
+    if (cfg.tunnel.sentinel != derive.default_sentinel) {
+        const sb = try std.fmt.allocPrint(arena, " --sentinel 0x{X:0>2}", .{cfg.tunnel.sentinel});
+        try s.appendSlice(arena, sb);
+    }
+    if (encoding_forced) {
+        try s.appendSlice(arena, " --encoding ");
+        try s.appendSlice(arena, @tagName(cfg.tunnel.encoding));
+    }
+    return s.items;
 }
 
 /// 解析 "localport:host:port"（host 可为 IPv4 或域名；域名在服务端解析）。
@@ -84,6 +126,7 @@ fn runMain(init: std.process.Init) !u8 {
     var key: ?[]const u8 = null;
     var marker: ?[]const u8 = null;
     var sentinel_arg: ?u8 = null;
+    var push_path: ?[]const u8 = null;
     var udp_forwards: std.ArrayList(rt.UdpForward) = .empty;
     defer udp_forwards.deinit(alloc);
 
@@ -130,6 +173,10 @@ fn runMain(init: std.process.Init) !u8 {
             try udp_forwards.append(alloc, parseUdpForward(args[i]) orelse return usageErr());
         } else if (std.mem.eql(u8, a, "--no-socks")) {
             cfg.socks5_listen = false;
+        } else if (std.mem.eql(u8, a, "--push")) {
+            i += 1;
+            if (i >= args.len) return usageErr();
+            push_path = args[i]; // 二进制路径，或 "self" 用本机正在跑的 /proc/self/exe
         } else if (std.mem.eql(u8, a, "--")) {
             custom = args[i + 1 ..];
             break;
@@ -193,9 +240,27 @@ fn runMain(init: std.process.Init) !u8 {
         try argv.append(alloc, "-o");
         try argv.append(alloc, "ServerAliveCountMax=3");
         try argv.append(alloc, try alloc.dupeZ(u8, t));
-        var it = std.mem.tokenizeScalar(u8, remote_cmd, ' ');
-        while (it.next()) |tok| try argv.append(alloc, try alloc.dupeZ(u8, tok));
-        try appendResolved(alloc, &argv, cfg, encoding_forced);
+        if (push_path) |pp| {
+            // push 模式：读本地提供的 smodem 二进制 → base64 → 远端 dd 精确读走、
+            // 解码、exec serve。协议流随后由 cfg.preamble 之后的 tunnel 输出接上。
+            const bin = readFileAll(alloc, pp) catch |e| {
+                std.debug.print("smodem: cannot read binary '{s}': {s}\n", .{ pp, @errorName(e) });
+                return @intFromEnum(ExitCode.usage);
+            };
+            defer alloc.free(bin);
+            const enc = std.base64.standard.Encoder;
+            const b64 = try arena.alloc(u8, enc.calcSize(bin.len));
+            _ = enc.encode(b64, bin);
+            cfg.preamble = b64;
+            const suffix = try buildServeSuffix(arena, cfg, encoding_forced);
+            const boot = try std.fmt.allocPrintSentinel(arena, "f=$(mktemp)&&dd bs=1 count={d} 2>/dev/null|base64 -d>\"$f\"&&chmod +x \"$f\"&&exec \"$f\" serve{s}", .{ b64.len, suffix }, 0);
+            try argv.append(alloc, boot);
+            if (cfg.verbose) std.debug.print("smodem: push mode: uploading {d} KiB binary per connection\n", .{bin.len / 1024});
+        } else {
+            var it = std.mem.tokenizeScalar(u8, remote_cmd, ' ');
+            while (it.next()) |tok| try argv.append(alloc, try alloc.dupeZ(u8, tok));
+            try appendResolved(alloc, &argv, cfg, encoding_forced);
+        }
     }
     cfg.transport_argv = argv.items;
     try rt.run(alloc, cfg);

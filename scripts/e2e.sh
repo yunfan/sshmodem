@@ -84,5 +84,18 @@ print('ok')
 " >/dev/null 2>&1; then echo "  ok  udp static forward"; else echo "  FAIL udp static forward"; FAIL=1; fi
 kill $SM $UP 2>/dev/null; wait $SM 2>/dev/null
 
+echo "== push mode =="
+mkdir -p "$TMP/fakessh"
+cat > "$TMP/fakessh/ssh" <<'EOF'
+#!/bin/sh
+for a in "$@"; do last="$a"; done
+exec sh -c "$last"
+EOF
+chmod +x "$TMP/fakessh/ssh"
+PATH="$TMP/fakessh:$PATH" "$BIN" -q -p "$PORT" --push "$BIN" dummy >"$TMP/sm.log" 2>&1 &
+SM=$!; sleep 3
+check "push proxied" 200 "http://127.0.0.1:$HTTP/big.bin" "$TMP/op"
+kill $SM 2>/dev/null; wait $SM 2>/dev/null
+
 if [ "$FAIL" = 0 ]; then echo "E2E: ALL PASS"; else echo "E2E: FAILURES"; fi
 exit $FAIL
