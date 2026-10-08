@@ -25,7 +25,7 @@ pub const Hello = struct {
     stream_window: u32,
     session_window: u32,
     max_streams: u16,
-    impl: []const u8 = "smodem/0.3.0",
+    impl: []const u8 = "smodem/0.3.1",
 
     pub const fixed_len = 19; // version..impl_len
 

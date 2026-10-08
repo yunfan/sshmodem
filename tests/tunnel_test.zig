@@ -542,3 +542,47 @@ test "idle timeout fires when peer truly silent" {
     try client.tick(100);
     try std.testing.expectError(error.IdleTimeout, client.tick(500));
 }
+
+// ===================== 会话窗口不泄漏（协议 §7.4）=====================
+
+/// 开一条 client→server 流并让 server 接受，返回流 id。
+fn openAccepted(client: *Tunnel, server: *Tunnel) !u32 {
+    const id = try client.open("m");
+    try pump(client, server);
+    while (server.nextEvent()) |ev| if (ev == .stream_open) try server.accept(ev.stream_open.id, "");
+    try pump(client, server);
+    drainAll(client);
+    return id;
+}
+
+/// 反复"server 塞满流窗口 → client 不消费就 RESET"（= 浏览器中途取消下载）。
+/// 会话窗口只够两轮；不归还额度的话第三轮起 write 恒为 0，隧道静默卡死。
+fn abortedStreamsKeepSessionWindow(reset_before_delivery: bool) !void {
+    const cfg = smodem.tunnel.Config{ .stream_window = 8, .session_window = 16 };
+    var client = try Tunnel.init(alloc, cfg, .client);
+    defer client.deinit();
+    var server = try Tunnel.init(alloc, cfg, .server);
+    defer server.deinit();
+    try pump(&client, &server);
+    drainAll(&client);
+    drainAll(&server);
+
+    for (0..10) |_| {
+        const id = try openAccepted(&client, &server);
+        try std.testing.expectEqual(@as(usize, 8), try server.write(id, "01234567"));
+        // false：client 已收到数据但没 consume 就关；true：RESET 时数据还在路上。
+        if (!reset_before_delivery) try pump(&client, &server);
+        try client.reset(id, 0);
+        try pump(&client, &server);
+        drainAll(&client);
+        drainAll(&server);
+    }
+}
+
+test "reset with unconsumed data returns session window" {
+    try abortedStreamsKeepSessionWindow(false);
+}
+
+test "data arriving after reset returns session window" {
+    try abortedStreamsKeepSessionWindow(true);
+}

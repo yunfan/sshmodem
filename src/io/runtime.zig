@@ -94,7 +94,9 @@ const Conn = struct {
     t2s: std.ArrayList(u8) = .empty, // 待写给 socket 的字节（tunnel→socket 或握手应答）
     s2t: std.ArrayList(u8) = .empty, // 从 socket 读到但隧道尚未接受的字节（背压暂存）
     want_read: bool = true, // 是否还想从 socket 读（背压时关掉）
-    sock_eof: bool = false,
+    sock_eof: bool = false, // socket 读到 EOF（本方向终将 closeWrite）
+    peer_eof: bool = false, // 对端 CLOSE：t2s 冲刷完就 shutdown 写端
+    wr_shut: bool = false, // 已 shutdown 写端
     dead: bool = false,
 
     fn deinit(self: *Conn, alloc: Allocator) void {
@@ -187,7 +189,11 @@ const Runtime = struct {
                 }
             },
             .again => {},
-            .eof, .err => conn.dead = true,
+            .eof, .err => {
+                // 写不出去了，剩下的永远冲刷不完——丢掉，否则这条连接永远等不到回收。
+                conn.t2s.clearRetainingCapacity();
+                conn.dead = true;
+            },
         }
     }
 };
@@ -292,8 +298,9 @@ fn onStreamData(rt: *Runtime, id: u32, bytes: []const u8) !void {
 
 fn onStreamEof(rt: *Runtime, id: u32) !void {
     const conn = connByStream(rt, id) orelse return;
-    // 对端不再发数据：待 t2s 冲刷完，关闭 socket 写端。
-    net.shutdownWrite(conn.fd);
+    // 对端不再发数据：待 t2s 冲刷完再关 socket 写端（事件循环收尾处做）。
+    // 立刻 shutdown 会让还积压在 t2s 里的尾巴写失败、被截断。
+    conn.peer_eof = true;
 }
 
 fn onStreamReset(rt: *Runtime, id: u32) void {
@@ -599,7 +606,14 @@ fn driveSocks5Request(rt: *Runtime, conn: *Conn) !void {
                 conn.phase = .closing;
                 return;
             }
-            const id = try rt.tunnel.open(req.addr_block);
+            // 开不了流（如流数达上限）只拒这一个请求，不拆会话。
+            const id = rt.tunnel.open(req.addr_block) catch {
+                var rep: [32]u8 = undefined;
+                const n = socks5.buildError(&rep, .general);
+                try rt.queueToSock(conn, rep[0..n]);
+                conn.phase = .closing;
+                return;
+            };
             conn.stream_id = id;
             conn.phase = .awaiting;
             try rt.by_stream.put(id, conn);
@@ -624,7 +638,14 @@ fn startUdpAssociate(rt: *Runtime, conn: *Conn, req: socks5.Request) !void {
         return;
     };
     const port = net.localPort(relay);
-    const id = try rt.tunnel.openDatagram(req.addr_block);
+    const id = rt.tunnel.openDatagram(req.addr_block) catch {
+        net.close(relay);
+        var rep: [32]u8 = undefined;
+        const n = socks5.buildError(&rep, .general);
+        try rt.queueToSock(conn, rep[0..n]);
+        conn.phase = .closing;
+        return;
+    };
     const ua = try rt.alloc.create(UdpAssoc);
     ua.* = .{ .stream_id = id, .fd = relay, .ctrl = conn };
     try rt.udp.append(rt.alloc, ua);
@@ -652,7 +673,11 @@ fn pumpConnRead(rt: *Runtime, conn: *Conn) !void {
     var buf: [16384]u8 = undefined;
     switch (net.readFd(conn.fd, &buf)) {
         .n => |r| {
-            const accepted = try rt.tunnel.write(conn.stream_id, buf[0..r]);
+            // 流级失败（流已被对端 RESET 等）只关这一条连接；用 try 会拆掉整条会话。
+            const accepted = rt.tunnel.write(conn.stream_id, buf[0..r]) catch {
+                conn.dead = true;
+                return;
+            };
             if (accepted < r) {
                 // 隧道窗口/背压未全收：剩余存入 s2t，停读 socket，等窗口打开再喂。
                 try conn.s2t.appendSlice(rt.alloc, buf[accepted..r]);
@@ -662,7 +687,9 @@ fn pumpConnRead(rt: *Runtime, conn: *Conn) !void {
         .again => {},
         .eof => {
             conn.sock_eof = true;
-            if (conn.s2t.items.len == 0) try rt.tunnel.closeWrite(conn.stream_id);
+            if (conn.s2t.items.len == 0) rt.tunnel.closeWrite(conn.stream_id) catch {
+                conn.dead = true;
+            };
             conn.want_read = false;
         },
         .err => conn.dead = true,
@@ -670,16 +697,21 @@ fn pumpConnRead(rt: *Runtime, conn: *Conn) !void {
 }
 
 // 背压恢复：把暂存的 s2t 再喂给隧道。
-fn retryConnWrite(rt: *Runtime, conn: *Conn) !void {
-    if (conn.stream_id == 0 or conn.s2t.items.len == 0) return;
-    const accepted = try rt.tunnel.write(conn.stream_id, conn.s2t.items);
+fn retryConnWrite(rt: *Runtime, conn: *Conn) void {
+    if (conn.dead or conn.stream_id == 0 or conn.s2t.items.len == 0) return;
+    const accepted = rt.tunnel.write(conn.stream_id, conn.s2t.items) catch {
+        conn.dead = true;
+        return;
+    };
     if (accepted > 0) {
         const rem = conn.s2t.items.len - accepted;
         if (rem > 0) std.mem.copyForwards(u8, conn.s2t.items[0..rem], conn.s2t.items[accepted..]);
         conn.s2t.shrinkRetainingCapacity(rem);
         if (rem == 0) {
             if (conn.sock_eof) {
-                try rt.tunnel.closeWrite(conn.stream_id);
+                rt.tunnel.closeWrite(conn.stream_id) catch {
+                    conn.dead = true;
+                };
             } else {
                 conn.want_read = true;
             }
@@ -760,12 +792,16 @@ fn eventLoop(rt: *Runtime) !void {
                     continue;
                 }
                 if (conn.phase == .connecting and (pfd.revents & POLLOUT) != 0) {
+                    // 连接期间流可能已被对端 RESET（客户端取消了请求）：只关这条，不拆会话。
                     const e = net.connectResult(conn.fd);
                     if (e == posix.E.SUCCESS) {
-                        try rt.tunnel.accept(conn.stream_id, socks5EncodeBind());
+                        rt.tunnel.accept(conn.stream_id, socks5EncodeBind()) catch {
+                            conn.dead = true;
+                            continue;
+                        };
                         conn.phase = .piping;
                     } else {
-                        try rt.tunnel.reject(conn.stream_id, @intFromEnum(mapErrno(e)));
+                        rt.tunnel.reject(conn.stream_id, @intFromEnum(mapErrno(e))) catch {};
                         conn.dead = true;
                     }
                     continue;
@@ -786,7 +822,7 @@ fn eventLoop(rt: *Runtime) !void {
         try handleTunnelEvents(rt);
 
         // 背压恢复：尝试把暂存的 s2t 再喂给隧道
-        for (rt.conns.items) |conn| try retryConnWrite(rt, conn);
+        for (rt.conns.items) |conn| retryConnWrite(rt, conn);
 
         // 冲刷各 socket、清理死连接
         var i: usize = 0;
@@ -802,6 +838,16 @@ fn eventLoop(rt: *Runtime) !void {
                 continue;
             }
             if (conn.phase == .closing and flushed) {
+                rt.dropConn(conn);
+                continue;
+            }
+            if (conn.peer_eof and flushed and !conn.wr_shut) {
+                net.shutdownWrite(conn.fd);
+                conn.wr_shut = true;
+            }
+            // 两个方向都正常结束（隧道流此时已由双向 CLOSE 移除）→ 回收。
+            // 漏了这步，每条正常关闭的连接都会永久占着一个 fd。
+            if (conn.wr_shut and conn.sock_eof and conn.s2t.items.len == 0) {
                 rt.dropConn(conn);
                 continue;
             }

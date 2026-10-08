@@ -90,7 +90,7 @@ while (t.nextEvent()) |ev| switch (ev) { ... }
 
 ## 实现状态
 
-已完成并测试（45 单测 + 端到端 e2e 全绿）：
+已完成并测试（49 单测 + 端到端 e2e 全绿）：
 
 - 第零层 codec：crc32 / derive / address / frame / encoding(RAW/ESC/B64/B32，参数化哨兵)
 - 第一层 tunnel：握手、SS 定界+CRC 重同步+冲刷、双层窗口流控+半关闭、
@@ -121,5 +121,6 @@ while (t.nextEvent()) |ev| switch (ev) { ... }
 连接保活与自愈：默认 ssh 命令带 `ServerAliveInterval=15 ServerAliveCountMax=3`
 （沉默也发保活、死链 45s 内探明）；传输一旦断开自动重连（指数退避 1→30s），
 **本地 SOCKS5 监听端口全程不关**，上层代理不受影响（决策 D15）。
+单条流出问题只关这一条连接，不会拖垮会话；会话窗口与 fd 不随取消/关闭的连接泄漏（D31）。
 
 未做：交互式传输驱动（堡垒机只给 shell 不许带命令的兜底；单开一条命令代理即可绕开）。

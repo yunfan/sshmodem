@@ -13,6 +13,7 @@ command -v curl >/dev/null || { echo "SKIP: curl not found"; exit 0; }
 command -v python3 >/dev/null || { echo "SKIP: python3 not found"; exit 0; }
 
 head -c 3000000 /dev/urandom > "$TMP/big.bin"
+truncate -s 1G "$TMP/huge.bin"   # 稀疏文件，不占盘；给"中途取消"用
 ( cd "$TMP" && python3 -m http.server "$HTTP" --bind 127.0.0.1 >/dev/null 2>&1 ) &
 sleep 1
 
@@ -83,6 +84,21 @@ assert d==b'E:ping', d
 print('ok')
 " >/dev/null 2>&1; then echo "  ok  udp static forward"; else echo "  FAIL udp static forward"; FAIL=1; fi
 kill $SM $UP 2>/dev/null; wait $SM 2>/dev/null
+
+echo "== robustness =="
+"$BIN" -q -p "$PORT" -- "$BIN" serve >"$TMP/sm.log" 2>&1 &
+SM=$!; sleep 1
+# 中途取消的下载不能把会话窗口吃光（协议 §7.4）：之前约 20 次后隧道静默卡死。
+for i in $(seq 1 40); do curl -s -m 0.3 -x "socks5h://127.0.0.1:$PORT" "http://127.0.0.1:$HTTP/huge.bin" -o /dev/null; done
+check "after 40 aborted downloads" 200 "http://127.0.0.1:$HTTP/big.bin" "$TMP/or"
+# 正常关闭的连接必须回收 fd（Linux /proc）。
+if [ -d /proc/$SM/fd ]; then
+  before=$(ls /proc/$SM/fd | wc -l)
+  for i in $(seq 1 50); do curl -s -m 5 -x "socks5h://127.0.0.1:$PORT" "http://127.0.0.1:$HTTP/" -o /dev/null; done
+  sleep 1; after=$(ls /proc/$SM/fd | wc -l)
+  if [ $((after - before)) -le 2 ]; then echo "  ok  no fd leak ($before -> $after)"; else echo "  FAIL fd leak ($before -> $after after 50 requests)"; FAIL=1; fi
+fi
+kill $SM 2>/dev/null; wait $SM 2>/dev/null
 
 echo "== push mode =="
 mkdir -p "$TMP/fakessh"

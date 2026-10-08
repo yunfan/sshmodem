@@ -40,7 +40,7 @@ pub const Config = struct {
     session_window: u32 = 2 * 1024 * 1024,
     max_streams: u16 = 256,
     caps: u32 = 0,
-    impl: []const u8 = "smodem/0.3.0",
+    impl: []const u8 = "smodem/0.3.1",
     handshake_timeout_ms: u64 = 10_000,
     keepalive_ms: u64 = 30_000,
     idle_timeout_ms: u64 = 90_000,
@@ -392,7 +392,7 @@ pub const Tunnel = struct {
         const s = try self.getStream(id);
         if (s.state != .open_pending) return error.BadStreamState;
         try self.pushFrame(.open_err, id, &[_]u8{code});
-        self.dropStream(id);
+        try self.dropStream(id);
     }
 
     /// 写入流。返回实际接受的字节数（受窗口 + tx 背压限制），可能小于 bytes.len。
@@ -413,17 +413,23 @@ pub const Tunnel = struct {
 
     /// 告知隧道：流 id 上已消费（写给下游）n 字节，可回补窗口。
     pub fn consume(self: *Tunnel, id: u32, n: u32) Error!void {
-        const s = self.streams.get(id) orelse return; // 流可能已关，忽略
+        const s = self.streams.get(id) orelse return; // 流已关：额度已由 dropStream 归还
         s.recv_pending_ack += n;
         s.recv_remaining += n;
-        self.session_recv_pending_ack += n;
-        self.session_recv_remaining += n;
         if (s.recv_pending_ack >= self.cfg.stream_window / 2) {
             var wb: [4]u8 = undefined;
             std.mem.writeInt(u32, &wb, s.recv_pending_ack, .little);
             try self.pushFrame(.window, id, &wb);
             s.recv_pending_ack = 0;
         }
+        try self.creditSession(n);
+    }
+
+    /// 归还 n 字节会话接收额度，攒够半个窗口发一帧 SESSION_WINDOW（协议 §7.1）。
+    fn creditSession(self: *Tunnel, n: u32) Error!void {
+        if (n == 0) return;
+        self.session_recv_pending_ack += n;
+        self.session_recv_remaining += n;
         if (self.session_recv_pending_ack >= self.cfg.session_window / 2) {
             var wb: [4]u8 = undefined;
             std.mem.writeInt(u32, &wb, self.session_recv_pending_ack, .little);
@@ -437,7 +443,7 @@ pub const Tunnel = struct {
         try self.pushFrame(.close, id, "");
         switch (s.state) {
             .open => s.state = .half_local,
-            .half_remote => self.dropStream(id),
+            .half_remote => try self.dropStream(id),
             else => {},
         }
     }
@@ -445,11 +451,18 @@ pub const Tunnel = struct {
     pub fn reset(self: *Tunnel, id: u32, reason: u8) Error!void {
         _ = try self.getStream(id);
         try self.pushFrame(.reset, id, &[_]u8{reason});
-        self.dropStream(id);
+        try self.dropStream(id);
     }
 
-    fn dropStream(self: *Tunnel, id: u32) void {
-        if (self.streams.fetchRemove(id)) |kv| self.alloc.destroy(kv.value);
+    /// 移除流，并把它"已收到、还没 consume"的字节的会话额度还给对端（协议 §7.4）：
+    /// 流没了就不会再有 consume，不还的话每条带着在途数据被关掉的流都会永久吃掉
+    /// 一块会话窗口，攒到耗尽后所有流静默卡死——而保活照常，永远不会触发重连。
+    fn dropStream(self: *Tunnel, id: u32) Error!void {
+        const kv = self.streams.fetchRemove(id) orelse return;
+        const s = kv.value;
+        const unconsumed: u32 = if (s.kind == .tcp) self.cfg.stream_window -| s.recv_remaining else 0;
+        self.alloc.destroy(s);
+        try self.creditSession(unconsumed);
     }
 
     // ===================== UDP 关联（协议 §9）=====================
@@ -480,7 +493,7 @@ pub const Tunnel = struct {
         const s = try self.getStream(id);
         if (s.kind != .udp or s.state != .open_pending) return error.BadStreamState;
         try self.pushFrame(.udp_open_err, id, &[_]u8{code});
-        self.dropStream(id);
+        try self.dropStream(id);
     }
 
     /// 发一个数据报。tx 过载则丢弃（返回 false），符合 UDP 可丢语义（协议 §9.3）。
@@ -493,8 +506,8 @@ pub const Tunnel = struct {
         return true;
     }
 
-    pub fn closeDatagram(self: *Tunnel, id: u32) void {
-        self.dropStream(id);
+    pub fn closeDatagram(self: *Tunnel, id: u32) Error!void {
+        try self.dropStream(id);
     }
 
     // ===================== RX =====================
@@ -857,17 +870,21 @@ pub const Tunnel = struct {
         if (s.state != .opening_local) return error.ProtocolError;
         const code: u8 = if (payload.len > 0) payload[0] else 1;
         try self.push(.{ .stream_reject = .{ .id = sid, .code = code } });
-        self.dropStream(sid);
+        try self.dropStream(sid);
     }
 
     fn onData(self: *Tunnel, sid: u32, payload: []const u8) Error!void {
-        const s = self.streams.get(sid) orelse return; // 已关流的残留数据丢弃
-        if (s.state != .open and s.state != .half_local) return; // 对端已 EOF 还发？忽略
         const n: u32 = @intCast(payload.len);
+        // 丢弃的 DATA 对端也已扣过会话窗口，照样归还（协议 §7.4）。
+        // 最常见的是已关流的残留：我方 RESET 还在路上时对端发出的数据。
+        const s = self.streams.get(sid) orelse return self.creditSession(n);
+        if (s.state != .open and s.state != .half_local) return self.creditSession(n); // 对端已 EOF 还发
         if (n > s.recv_remaining or n > self.session_recv_remaining) {
-            // 超窗（对端 bug）→ RESET 该流
+            // 超窗（对端 bug）→ RESET 该流，并告知应用
             try self.pushFrame(.reset, sid, &[_]u8{0x03});
-            self.dropStream(sid);
+            try self.dropStream(sid);
+            try self.creditSession(n);
+            try self.push(.{ .stream_reset = .{ .id = sid, .reason = 0x03 } });
             return;
         }
         s.recv_remaining -= n;
@@ -881,7 +898,7 @@ pub const Tunnel = struct {
         try self.push(.{ .stream_eof = sid });
         switch (s.state) {
             .open => s.state = .half_remote,
-            .half_local => self.dropStream(sid),
+            .half_local => try self.dropStream(sid),
             else => {},
         }
     }
@@ -889,7 +906,7 @@ pub const Tunnel = struct {
     fn onReset(self: *Tunnel, sid: u32, reason: u8) Error!void {
         if (self.streams.get(sid) == null) return;
         try self.push(.{ .stream_reset = .{ .id = sid, .reason = reason } });
-        self.dropStream(sid);
+        try self.dropStream(sid);
     }
 
     fn onUdpOpen(self: *Tunnel, sid: u32, metadata: []const u8) Error!void {
@@ -915,7 +932,7 @@ pub const Tunnel = struct {
         if (s.kind != .udp or s.state != .opening_local) return error.ProtocolError;
         const code: u8 = if (payload.len > 0) payload[0] else 1;
         try self.push(.{ .datagram_reject = .{ .id = sid, .code = code } });
-        self.dropStream(sid);
+        try self.dropStream(sid);
     }
 
     fn onUdpData(self: *Tunnel, sid: u32, payload: []const u8) Error!void {

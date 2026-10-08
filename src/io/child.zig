@@ -57,8 +57,15 @@ pub fn spawn(argv: []const [:0]const u8, buf_argv: [][*:null]const ?[*:0]const u
 }
 
 /// 终止并回收子进程（避免僵尸）。重连前调用。
+/// 2s 内不肯退（自定义传输命令吞了 SIGTERM 之类）就 SIGKILL——
+/// 阻塞在这里等于永远不再重连。
 pub fn stop(self: Child) void {
     _ = c.kill(self.pid, .TERM);
     var status: c_int = 0;
-    _ = c.waitpid(self.pid, &status, 0);
+    var waited_ms: u32 = 0;
+    while (c.waitpid(self.pid, &status, c.W.NOHANG) == 0) : (waited_ms += 50) {
+        if (waited_ms == 2000) _ = c.kill(self.pid, .KILL);
+        var none: [0]std.posix.pollfd = .{};
+        _ = std.posix.poll(&none, 50) catch {};
+    }
 }
